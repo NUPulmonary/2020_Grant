@@ -3440,7 +3440,8 @@ biomarker_plot_d0
 I think the most conservative approach is to compare against the upper limit of "normal": 10mg/L   
    
 ```{r}
-
+crp_data = subset(biomarker_d0, Biomarker == "CRP")
+wilcox.test(x = crp_data$value, mu = 10)
 ```
 
   
