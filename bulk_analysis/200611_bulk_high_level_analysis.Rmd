@@ -11,6 +11,9 @@ output: html_notebook
 ## Load packages   
 ```{r setup}
 library(ggplot2)
+library(ggplotify)
+library(ggsignif)
+library(Cairo)
 library(DESeq2)
 library(pheatmap)
 library(RColorBrewer)
@@ -27,6 +30,7 @@ library(org.Hs.eg.db)
 library(parallel)
 library(doParallel)
 library(biomaRt)
+library(openxlsx)
 registerDoParallel(makeCluster(12))
 register(MulticoreParam(12))
 options(gsubfn.engine = "R")
@@ -63,8 +67,20 @@ metadata = as.data.frame(colData(mp))
 ## Summary stats   
 ### Number of samples overall   
 ```{r}
-table(mp_des$covid_confirmed)
+table(mp$covid_confirmed, useNA = "always")
+table(mp$pna_type, useNA = "always")
+```   
+   
+### Number of patients   
+```{r}
+bulk_patients = colData(mp) %>% 
+  as.data.frame() %>% 
+  dplyr::select(study_id, covid_confirmed, pna_type) %>% 
+  unique()
+table(bulk_patients$covid_confirmed)
+table(bulk_patients$pna_type)
 ```
+
 
 ### Number of serial samples   
 ```{r}
@@ -330,7 +346,8 @@ viral_expression_heatmap = pheatmap(viral_counts,
                                                 "Influenza A/California/07/2009" = fig2_pal[3], "Other Coronavirus & Influenza A/California/07/2009" = fig2_pal[4]),
                                   `Viral Origin` = c("SARS-CoV-2" = fig2_pal[1], "Influenza A/California/07/2009" = fig2_pal[3])),
         angle_col = 45, 
-        annotation_names_row = F)
+        annotation_names_row = F, 
+        fontsize = 24)
 ```
    
 ### Patient 1174   
@@ -377,12 +394,19 @@ covid_counts_binarized = covid_counts %>%
   unique() %>% 
   mutate(virus_detected = all_viral_counts > 0)
 
-cor.test(covid_counts_binarized$all_viral_counts, covid_counts_binarized$day_of_intubation, method = "spearman")
+time_cor = cor.test(covid_counts_binarized$all_viral_counts, covid_counts_binarized$day_of_intubation, method = "spearman")
+time_cor_rho = round(time_cor$estimate, digits = 2)
 
-ggplot(covid_counts_binarized, aes(x = day_of_intubation, y = all_viral_counts)) +
+sars_time_cor = ggplot(covid_counts_binarized, aes(x = day_of_intubation, y = all_viral_counts)) +
   geom_point() +
-  scale_y_continuous(trans = "log2") +
-  geom_smooth(se = F)
+  scale_y_continuous(trans = "log10") +
+  xlab("Day of Mechanical Ventilation") +
+  ylab("SARS-CoV-2 Counts") +
+  geom_smooth(se = F, color = fig2_pal[2]) +
+  theme_bw(base_family = "Arial", base_size = 32) +
+  theme(text = element_text(family = "Arial")) +
+  annotate(x = 30, y = 5e4, label = paste("ρ = ", time_cor_rho), size = 10, geom = "text")
+sars_time_cor
 ```
 
 ## Export for modeling core   
@@ -568,7 +592,7 @@ pretty_MA_plot(cov2_vs_ovp_results, custom_annotation =  gene_conv)
 ### Heatmap   
    
 How many clusters does it take?   
-```{r}
+```{r eval=FALSE}
 elbow = k_elbow(dge = mp_des, design = "~Diagnosis", 
         cores = 12, 
         minReps = Inf,
@@ -579,7 +603,7 @@ elbow
 ```   
 5 seems fair.   
     
-```{r}
+```{r eval=FALSE}
 intubation_pal = colorRampPalette(brewer.pal(n = 9, name = "Purples")[3:9])(max(mp_des$finite_day_of_intubation, na.rm = T) + 1)
 intubation_pal[1:3] = rep("#000000",3) #highlight "D0"
 
@@ -594,7 +618,7 @@ cov2_kmeans_noclustering = k_means_figure(dge = mp_des,
                              minReps = Inf,
                              return_genes = T,
                              display_go_terms = F,
-                             return_go_terms = T,
+                             return_go_terms = F,
                              cluster_columns = F,
                              show_rownames = F,
                              baseMeanCutoff = 20,
@@ -608,7 +632,7 @@ cov2_kmeans_noclustering = k_means_figure(dge = mp_des,
                                                       finite_day_of_intubation =  intubation_pal), 
                              custom_order = c(3, 5, 1, 2, 4), 
                              sortColumns = T,
-                             column_sort_factors = c("Diagnosis", "day0_sample"))
+                             column_sort_factors = c("Diagnosis", "finite_day_of_intubation"))
 
 cov2_kmeans_clustered = k_means_figure(dge = mp_des,
                                  design = "~Diagnosis",
@@ -640,7 +664,13 @@ for(i in 1:length(cov2_kmeans_clustered$GO))
 }
 cov2_kmeans_clustered$go_df = bind_rows(cov2_kmeans_clustered$GO) %>% 
   arrange(cluster, padj)
-saveRDS(cov2_kmeans_clustered, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_clustered.rds")
+cov2_kmeans_clustered$expression = counts(mp_des, normalized = T) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  dplyr::filter(ensembl_gene_id %in% cov2_kmeans_clustered$genes$gene) %>% 
+  right_join(gene_conv, .)
+saveRDS(cov2_kmeans_clustered, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200802_k_means_clustered.rds")
+saveRDS(cov2_kmeans_noclustering, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_unclustered.rds")
 write.csv(cov2_kmeans_clustered$genes, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_genes.csv")
 write.csv(cov2_kmeans_clustered$go_df, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_GO.csv")
 ```   
@@ -823,48 +853,8 @@ sasha_gene_plot = ggplot(sasha_counts, aes(x = Diagnosis, y = count, fill = Diag
   theme(legend.position = "none") +
   facet_wrap(~gene_name)
 sasha_gene_plot
-```
+```   
 
-   
-# Compare with sort data   
-## Subset to samples with sorting data   
-```{r}
-sorted = mp[, !is.na(mp$percent_total_CD206_high)]
-design(sorted) = ~Diagnosis + percent_total_CD206_high
-```   
-   
-## Determine best dispersion estimates   
-### Parametric   
-```{r}
-sorted_des_parametric = DESeq(sorted, 
-                          fitType = "parametric",
-                          parallel = T) #no outliers in this case
-plotDispEsts(sorted_des_parametric)
-```   
-Actually very decent      
-    
-### Local
-```{r}
-sorted_des_local = DESeq(sorted, 
-                          fitType = "local",
-                          parallel = T)
-plotDispEsts(sorted_des_local)
-sorted_des = sorted_des_local 
-rm(sorted_des_local, sorted_des_parametric)
-```  
-Both have their issues but this at least does not throw out low-expression genes for having infinite dispersion.   
-   
-## PCA   
-```{r}
-pca_data = plotPCA(vst(sorted),
-                   intgroup = c("covid_confirmed"),
-                   returnData = T)
-pca_data = left_join(pca_data,
-                     as.data.frame(colData(mp)),
-                     by = c("name" = "sample", "covid_confirmed"))
-ggplot(pca_data, aes(x = PC1, y = PC2, shape = covid_confirmed, color = percent_total_CD206_high)) +
-  geom_point(size = 2)
-```
    
 ## Clustering   
 ### All samples   
@@ -953,91 +943,7 @@ pheatmap(top_day0_counts,
          color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
          angle_col = 45)
 ```
-
    
-## DEA   
-Versus controls
-```{r}
-cov2_vs_npc_results = as.data.frame(results(object = sorted_des,
-                                  contrast = c("Diagnosis", "COVID_19", "Non_Pneumonia_Control"),
-                                  alpha = 0.05,
-                                  parallel = T))
-
-cov2_vs_npc_results_ids = cov2_vs_npc_results %>% 
-  rownames_to_column("ensembl_gene_id") %>% 
-  left_join(., gene_conv) %>% 
-  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
-
-write.csv(cov2_vs_npc_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_covid_over_nonpneumoniacontrols.csv")
-
-cov2_vs_npc_results_ids
-```
-   
-Versus other viral PNA
-```{r}
-cov2_vs_ovp_results = as.data.frame(results(object = sorted_des,
-                                  contrast = c("Diagnosis", "COVID_19", "Other_Viral_Pneumonia"),
-                                  alpha = 0.05,
-                                  parallel = T))
-
-cov2_vs_ovp_results_ids = cov2_vs_ovp_results %>% 
-  rownames_to_column("ensembl_gene_id") %>% 
-  left_join(., gene_conv) %>% 
-  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
-
-write.csv(cov2_vs_ovp_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_covid_over_otherviralpneumonia.csv")
-
-cov2_vs_npc_results_ids
-```   
-   
-```{r}
-cov2_vs_other_pna_results = as.data.frame(results(object = sorted_des,
-                                  contrast = c("Diagnosis", "COVID_19", "Other_Pneumonia"),
-                                  alpha = 0.05,
-                                  parallel = T))
-
-cov2_vs_other_pna_results_ids = cov2_vs_other_pna_results %>% 
-  rownames_to_column("ensembl_gene_id") %>% 
-  left_join(., gene_conv) %>% 
-  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
-
-write.csv(cov2_vs_other_pna_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_covid_over_otherpneumonia.csv")
-
-cov2_vs_other_pna_results_ids
-```   
-Unsurprisingly, there are very few valid differences here
-   
-### MoAM percentage   
-```{r}
-MoAM_results_sorted = results(sorted_des, 
-                               name = c("percent_total_CD206_high")) %>% 
-  as.data.frame()
-
-MoAM_results_sorted_ids = MoAM_results_sorted %>% 
-  rownames_to_column("ensembl_gene_id") %>% 
-  left_join(., gene_conv) %>% 
-  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
-
-write.csv(MoAM_results_sorted_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_percent_CD206_high.csv")
-
-MoAM_results_sorted_ids
-pretty_MA_plot(MoAM_results_sorted, mart_name = "hsapiens_gene_ensembl")
-```
-This looks quite resasuring. CD206 hi samples have elevated expression of FABP4, anticorrelates with SPP1, CXCL8.       
-   
-### What can be explained by MoAM% alone?   
-TMPRSS2
-```{r}
-d = plotCounts(sorted_des, 
-               gene = "ENSG00000184012",
-               intgroup = "percent_total_CD206_high",
-               normalized = T,
-               returnData = T)
-ggplot(d, aes(x = percent_total_CD206_high, y = count)) +
-  geom_point() +
-  ylab("MRC1 (CD206) Counts")
-```
-
 ## Comparing different pathogens   
 ### Individual pathogens   
 ```{r eval=FALSE}
@@ -1415,8 +1321,7 @@ module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
                               color = colorRampPalette(rev(brewer.pal(n = 7, 
                                                           name = "RdBu")))(100),
                               angle_col = 315, 
-                              fontsize_row = 32,
-                              fontsize = 24)
+                              fontsize = 32)
 ```
 Module 12 (turquoise) looks like the key MoAM cluster, 4 (blue) is key TRAM, and module 14 (purple) is likely our IFN cluster.
 
@@ -1486,7 +1391,7 @@ labs = c("Deceased", "COVID-19", "SARS-CoV-2 Detected", "Any Pneumonia", "Other 
          "Healthy Control", "% Neutrophils", "% Macrophages CD206-high", "% CD4 T", "% CD8 T",
          "Day of Intubation", "CRP", "D-Dimer", "Procalcitonin", "Mean APS",
          "Static Compliance", "P/F Ratio")
-module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
+module_cor_heatmap_vent_mini = pheatmap(mat = moduleTraitCor_hm,
                               labels_row = labs,
                               labels_col = paste("Module", c(1:ncol(MEs))),
                               display_numbers = pvals_hm,
@@ -1496,7 +1401,7 @@ module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
                               color = colorRampPalette(rev(brewer.pal(n = 7, 
                                                           name = "RdBu")))(100),
                               angle_col = 315)
-module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
+module_cor_heatmap_vent = pheatmap(mat = moduleTraitCor_hm,
                               labels_row = labs,
                               labels_col = paste("Module", c(1:ncol(MEs))),
                               display_numbers = pvals_hm,
@@ -1506,8 +1411,8 @@ module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
                               color = colorRampPalette(rev(brewer.pal(n = 7, 
                                                           name = "RdBu")))(100),
                               angle_col = 315, 
-                              fontsize_row = 32,
                               fontsize = 24)
+saveRDS(module_cor_heatmap_vent, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200803_WGCNA_cor_heatmap.rds")
 ```   
 Module 13 (salmon) may also be interesting. Correlates with COVID, CRP, lymphocytes, and vent params!    
    
@@ -1637,10 +1542,9 @@ ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEpurple, color = Diagnosi
   geom_point()
 module14_umap = ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEpurple, color = pna_type, shape = binned_outcome)) +
   geom_point() +
-  theme_bw() +
-  theme(text = element_text(size = 16, family = "Arial"),
-        legend.text = element_text(size = 16, family = "Arial"),
-        legend.title = element_text(size = 16, family = "Arial")) +
+   theme_bw() +
+  theme(text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
   scale_color_manual(name = "",
                     values = c("Healthy_Control" = fig2_pal[6],
                                "Non-Pneumonia Control" = fig2_pal[2],
@@ -1761,19 +1665,19 @@ Not a ton of detection but very clean.
 ```{r}
 mp_des$orf8_detected = mp_des$sample %in% orf8_samples
 total_umap$orf8_detected = total_umap$sample %in% orf8_samples
-ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = MEpurple, color = Diagnosis, shape = orf8_detected)) +
+ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEpurple, color = Diagnosis, shape = orf8_detected)) +
   geom_point()
 ```  
 Pretty clear spatial correlation...but in the opposite direction?   
    
 ```{r}
-ggplot(total_umap, aes(x = orf8_detected, y = MEpurple)) +
+ggplot(total_umap, aes(x = orf8_detected, y = AEpurple)) +
   geom_boxplot() +
   geom_jitter(aes(color = Diagnosis))
 
 high_cov2 = colnames(cov2_counts)[colSums(cov2_counts) > 50]
 total_umap$cov2_detected = total_umap$sample %in% high_cov2
-ggplot(total_umap, aes(x = cov2_detected, y = MEpurple)) +
+ggplot(total_umap, aes(x = cov2_detected, y = AEpurple)) +
   geom_boxplot() +
   geom_jitter(aes(color = Diagnosis))
 ```
@@ -1783,9 +1687,18 @@ This really just correlates with overall viral load (which correlates, in turn, 
 ## WGCNA Module purple   
 ### Average expression   
 ```{r}
-ggplot(covid_umap, aes(x = finite_day_of_intubation, y = AEpurple)) +
+m14_cor = cor.test(covid_umap$AEpurple, covid_umap$finite_day_of_intubation)
+module_14_corplot = ggplot(covid_umap, aes(x = finite_day_of_intubation, y = AEpurple)) +
   geom_point() +
-  geom_smooth(method = "lm")
+  annotate(geom = "text", x = 30, y = 2, label = paste0("R = ", round(m14_cor$estimate, digits = 2)), size = 6) +
+  geom_smooth(method = "lm", color = fig2_pal[2]) +
+  theme_bw() +
+  xlab("Day of Mechanical Ventilation") +
+  ylab("Average Module 14 Expression") +
+  theme(legend.position = "none", 
+        text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5))
+module_14_corplot
 ```
    
 ## GO Categories   
@@ -1825,34 +1738,45 @@ ifn_counts = as.data.frame(colMeans(ifn_counts)) %>%
 colnames(ifn_counts)[2] = "general_IFN_response"
 
 covid_umap = covid_umap %>% 
-  dplyr::select(-c(typeI_IFN_response, IFNg_response, general_IFN_response)) %>% 
   left_join(., type1_counts) %>% 
   left_join(., type2_counts) %>% 
   left_join(., ifn_counts)
 ```
    
+### Correlations   
+```{r}
+typei_cor = cor.test(covid_umap$typeI_IFN_response, covid_umap$finite_day_of_intubation)
+typeii_cor = cor.test(covid_umap$IFNg_response, covid_umap$finite_day_of_intubation)
+general_cor = cor.test(covid_umap$general_IFN_response, covid_umap$finite_day_of_intubation)
+```
+   
 ### Plot   
 ```{r}
-ggplot(covid_umap, aes(x = finite_day_of_intubation, y = typeI_IFN_response)) +
+#GO:0060337
+typei_corplot = ggplot(covid_umap, aes(x = finite_day_of_intubation, y = typeI_IFN_response)) +
   geom_point() + 
   geom_smooth(method = "lm", color = fig2_pal[2]) +
+  annotate(geom = "text", x = 30, y = 1750, label = paste0("R = ", round(typei_cor$estimate, digits = 2)), size = 6) +
   theme_bw() +
   theme(legend.position = "none", 
         text = element_text(size = 32, family = "Arial"),
         plot.title = element_text(hjust = 0.5)) +
-  ylab("Average GO:0060337 Expression") +
+  ylab("Average Type I IFN Pathway Gene Expression") +
   xlab("Day of Mechanical Ventilation")
+typei_corplot 
 
-ggplot(covid_umap, aes(x = finite_day_of_intubation, y = IFNg_response)) +
+#GO:0060333
+typeii_corplot = ggplot(covid_umap, aes(x = finite_day_of_intubation, y = IFNg_response)) +
   geom_point() + 
   geom_smooth(method = "lm", color = fig2_pal[2]) +
+  annotate(geom = "text", x = 30, y = 3000, label = paste0("R = ", round(typeii_cor$estimate, digits = 2)), size = 6) +
   theme_bw() +
   theme(legend.position = "none", 
         text = element_text(size = 32, family = "Arial"),
         plot.title = element_text(hjust = 0.5)) +
-  ylab("Average GO:0060333 Expression") +
+  ylab("Average IFNg Pathway Gene Expression") +
   xlab("Day of Mechanical Ventilation")
-
+typeii_corplot
 
 ggplot(covid_umap, aes(x = finite_day_of_intubation, y = general_IFN_response)) +
   geom_point() + 
@@ -1864,13 +1788,6 @@ ggplot(covid_umap, aes(x = finite_day_of_intubation, y = general_IFN_response)) 
   ylab("Average IFN response Expression") +
   xlab("Day of Mechanical Ventilation")
 ```   
-   
-### Correlations   
-```{r}
-cor.test(covid_umap$typeI_IFN_response, covid_umap$finite_day_of_intubation)
-cor.test(covid_umap$IFNg_response, covid_umap$finite_day_of_intubation)
-cor.test(covid_umap$general_IFN_response, covid_umap$finite_day_of_intubation)
-```
 
 
    
@@ -1902,13 +1819,13 @@ selection
    
 # Conclusions   
 ## Output data for posterity   
-```{r}
+```{r eval=FALSE}
 final_counts_raw = counts(mp_des, normalized = F)
 
 #clean metadata for safe sharing
 final_md_safe = colData(mp_des) %>% 
   as.data.frame() %>% 
-  dplyr::select(sample, age, sex, race = races, ethnicity, diagnosis = pna_type, 
+  dplyr::select(sample, age, sex, diagnosis = pna_type, 
                 day_of_ventilation = finite_day_of_intubation, study_id)
 #convert script IDs to new identifiers
 id_conv = data.frame(script_id = sample(unique(final_md_safe$study_id))) %>% #shuffle IDs first
@@ -1919,5 +1836,175 @@ final_md_safe = left_join(final_md_safe, id_conv, by = c("study_id" = "script_id
 
 write.csv(final_counts_raw, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/200724_raw_counts_geo.csv")
 write.csv(final_md_safe, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/200724_deidentified_metadata_geo.csv")
+```
+   
+## Export supplemental files   
+### DEA
+```{r eval=FALSE}
+all_comparisons = combn(levels(mp_des$Diagnosis), 2, simplify = F)
+names(all_comparisons) = vapply(all_comparisons, function(x){
+  return(paste0(x[1], " vs ", x[2]))}, "char")
+dea_hits = lapply(all_comparisons, function(x){
+  hits = as.data.frame(results(object = mp_des,
+                                  contrast = c("Diagnosis", x[1], x[2]),
+                                  alpha = 0.05,
+                                  parallel = T)) %>% 
+    rownames_to_column("ensembl_gene_id") %>% 
+    left_join(., gene_conv) %>% 
+    arrange(padj)
+  return(hits)})
+names(dea_hits) = names(all_comparisons)
+saveRDS(dea_hits, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/200728_bulk_dea_complete.rds")
+```
+   
+### Export as single excel file   
+```{r eval=FALSE}
+output_genes = cov2_kmeans_clustered$genes %>% 
+  dplyr::select(ensembl_gene_id = gene, cluster, external_gene_name) %>% 
+  arrange(cluster)
+names(dea_hits) = gsub("Healthy_Control", "HC", names(dea_hits))
+names(dea_hits) = gsub("Other_Viral_Pneumonia", "OVP", names(dea_hits))
+names(dea_hits) = gsub("Other_Pneumonia", "OP", names(dea_hits))
+names(dea_hits) = gsub("Non_Pneumonia_Control", "NPC", names(dea_hits))
+names(dea_hits) = gsub("COVID_19", "COVID-19", names(dea_hits))
+all_sheets = c(list("k-means genes" = output_genes,
+                    "k-means GO enrichment" = cov2_kmeans_clustered$go_df),
+               dea_hits)
+write.xlsx(x = all_sheets, 
+           file = "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200728_bulk_supplmental_data.xlsx")
+```
+   
+## Assemble figures   
+### Figure 3   
+```{r}
+dea_hits = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/200728_bulk_dea_complete.rds")
+cov2_kmeans_clustered = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_clustered.rds")
+fig3_heatmap = cov2_kmeans_clustered$plot
+fig3_heatmap_gg = as.ggplot(fig3_heatmap)
+viral_expression_heatmap_gg = as.ggplot(viral_expression_heatmap)
+module_cor_heatmap_vent_gg = as.ggplot(module_cor_heatmap_vent)
+
+layout = "AABB\nAACC\nDEFG"
+bulk_plot_fig3 = fig3_heatmap_gg +
+  viral_expression_heatmap_gg +
+  module_cor_heatmap_vent_gg +
+  module14_umap +
+  module_14_corplot +
+  typei_corplot +
+  typeii_corplot +
+    plot_layout(design = layout) +
+    plot_annotation(tag_levels = 'a', 
+                  theme = theme(text = element_text(size = 120, family = "Arial"),
+                                legend.text=element_text(size=120)))
+
+bulk_plot_fig3
+```
+   
+### Figure S3  
+Marker genes   
+```{r}
+fig3_genes = c("IL6", "CCL24", "CCL8", "CCL2", "CCL7", 
+               "RNASE1", "CCR1", "MAFB", "CSF2RA", "BAG3", 
+               "HIF1", "LAMP3", "CCL20", "IL1A", "IL1B",
+               "CD164", "MFGE8", "FCGR2A", "IL13RA1", "FABP4",
+               "MSR1", "AXL", "C1QA", "ALOX5", "MARCO")
+gene_comps = lapply(names(dea_hits), function(x)
+{
+  sub = subset(dea_hits[[x]], gene_name %in% fig3_genes) %>% 
+    dplyr::filter(padj < 0.05)
+  if(nrow(sub) == 0)
+  {
+    return(NULL)
+  }
+  comp = unlist(strsplit(x, split = " vs "))
+  sub$numerator = comp[1]
+  sub$denominator = comp[2]
+  return(sub)
+})
+gene_comps = bind_rows(gene_comps) 
+
+fig3_genes = fig3_genes[fig3_genes %in% c("IL6", unique(gene_comps$gene_name))] #keep only genes with sig diffs and IL6
+fig3_genes = subset(gene_conv, gene_name %in% fig3_genes)
+s3_counts = mclapply(fig3_genes$ensembl_gene_id, function(x){
+  counts = plotCounts(mp_des,
+                      gene = x,
+                      intgroup = "Diagnosis",
+                      returnData = T,
+                      normalized = T,
+                      pc = T)
+  counts$gene = x
+  return(counts)})
+s3_counts = bind_rows(s3_counts) %>% 
+  left_join(., fig3_genes, by = c("gene" = "ensembl_gene_id"))
+
+#add y positions automatically
+gene_comps = mutate(gene_comps, label = format(padj, digits = 2, scientific = T)) %>% 
+  arrange(gene_name) %>% 
+  group_by(gene_name, .drop = T) %>% 
+  mutate(y = max(dplyr::filter(s3_counts, gene == unique(ensembl_gene_id))$count) * 10 ^ (1 + 0.5 * c(1:n()))) %>% 
+  mutate(y_log10 = (log10(y) - 1.3))
+
+marker_gene_plot = ggplot(s3_counts, aes(x = Diagnosis, y = count, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non_Pneumonia_Control" = fig2_pal[2],
+                               "COVID_19" = fig2_pal[1],
+                               "Other_Viral_Pneumonia" = fig2_pal[3],
+                               "Other_Pneumonia" = fig2_pal[4])) +
+  scale_x_discrete(labels = c("Healthy_Control" = "Healthy\nControl",
+                               "Non_Pneumonia_Control" = "Non-Pneumonia\nControl",
+                               "COVID_19" = "COVID-19",
+                               "Other_Viral_Pneumonia" = "Other Viral\nPneumonia",
+                               "Other_Pneumonia" = "Other\nPneumonia")) +
+  xlab("") +
+  ylab("Gene Counts") +
+  facet_wrap(~gene_name, scale = "free_y", ncol = 3) +
+  geom_signif(inherit.aes = F, 
+              data = gene_comps,
+              aes(xmin = numerator, xmax = denominator, annotations = label, y_position = y_log10),
+              tip_length = 0,
+              manual=TRUE,
+              family = "Arial",
+              textsize = 4) +
+theme_bw(base_family = "Arial", base_size = 32) +
+theme(legend.position = "none",
+         text = element_text(family = "Arial"),
+         axis.text.x = element_blank(),
+         axis.ticks.x = element_blank(),
+         plot.title = element_text(hjust = 0.5),
+         strip.background = element_blank())
+
+ marker_gene_plot
+```
+   
+```{r}
+cov2_kmeans_noclustering = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_unclustered.rds")
+coverage_plot = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200803_cov2_coverage_plot.rds")
+figS3_heatmap = cov2_kmeans_noclustering$plot
+figS3_heatmap_gg = as.ggplot(figS3_heatmap)
+
+layout = "ABB\nABB\nABB\nABB\n#BB\nCBB\nDBB"
+bulk_plot_fig3 = figS3_heatmap_gg +
+  marker_gene_plot +
+  sars_time_cor +
+  coverage_plot +
+    plot_layout(design = layout) +
+    plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 48))
+
+bulk_plot_fig3
+```
+   
+### Figure S3   
+```{r}
+md = as.data.frame(colData(mp_des))
+col_types = unlist(lapply(md, class))
+list_cols = names(col_types[col_types == "AsIs"])
+safe_md = md %>% 
+  dplyr::select(-c(all_of(list_cols))) %>% 
+  as.data.frame()
+write.csv(safe_md, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200730_bulk_mp_metadata.csv")
 ```
 

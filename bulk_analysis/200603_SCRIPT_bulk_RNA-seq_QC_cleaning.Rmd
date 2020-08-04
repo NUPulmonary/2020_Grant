@@ -260,6 +260,17 @@ ggplot(n_samples_patient, aes(x = Freq)) +
   ylab("Number of Patients")
 ```
 
+## Sequences per sample   
+```{r}
+joined_sample_data = md %>% 
+  dplyr::select(sample, n_seqs = FastQC_mqc_generalstats_fastqc_total_sequences) %>% 
+  dplyr::filter(sample != "hURNA") %>% 
+  group_by(sample) %>% 
+  dplyr::summarize(sample_seqs = sum(n_seqs))
+mean(joined_sample_data$sample_seqs) / 1e6
+hist(joined_sample_data$sample_seqs, n = 50)
+```
+
    
 # QC   
 ## Alignment and assignment   
@@ -507,7 +518,6 @@ PC1 is driven positively by lipid metabolism genes, such as FABP4, many of which
 saveRDS(script_bulk, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_script_bulk_des.rds")
 saveRDS(script_bulk_samples, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_script_bulk_des_no_hURNA.rds")
 ```
-
       
 # Conclusions   
 1. Although there is some variability in sequencing quality, mapped and assigned reads lead to a very clean dataset with good between-batch correspondence.   
