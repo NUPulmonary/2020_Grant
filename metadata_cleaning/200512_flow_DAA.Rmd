@@ -1,0 +1,3621 @@
+---
+title: "SCRIPT Flow DAA"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Goals   
+1. Perform differential abundance analysis on all cell populations identified from BAL flow by Sasha to identify cell expansion/depletion associated with COVID-19   
+
+# Setup   
+## Load packages   
+```{r setup message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggplotify)
+library(ggalluvial)
+library(xtable)
+library(later)
+library(Cairo)
+library(ggsci)
+library(ggsignif)
+library(googlesheets4)
+library(googledrive)
+library(gtools)
+library(tidyverse)
+library(summarytools)
+library(qwraps2)
+library(car)
+library(Hmisc)
+library(yardstick)
+library(readxl)
+library(ggfortify)
+library(lubridate)
+library(reshape2)
+library(pheatmap)
+library(RColorBrewer)
+library(ggwordcloud)
+library(tm)
+library(factoextra)
+library(uwot)
+library(igraph)
+library(patchwork)
+
+mean_sd = function(x){
+  return(mean_sdl(x, mult = 1))
+}
+
+set.seed(12345)
+```
+
+## Google login   
+```{r}
+drive_auth(use_oob = T, cache = T, email = "rogangrant2022@u.northwestern.edu") # have to run in console :(
+gs4_auth(token = drive_token(), use_oob = T, cache = T, email = "rogangrant2022@u.northwestern.edu")
+```
+
+
+## Import Sasha's data analysis results   
+```{r message=FALSE, warning=FALSE}
+data = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/20200707_COVID_SCRIPT_5L_Aria.xlsx",
+                        trim_ws = T,
+                        .name_repair = "universal",
+                        sheet = "cleaned",
+                  col_types = c("text", "text", rep("numeric", 12))) %>% 
+  as.data.frame() %>% 
+  mutate(panel = "new")
+prior_data = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/20200701_Pre-COVID_SCRIPT_6L_Aria.xlsx",
+                        trim_ws = T,
+                        .name_repair = "universal",
+                        sheet = "cleaned",
+                  col_types = c("text", "text", rep("numeric", 12))) %>% 
+  as.data.frame() %>% 
+  mutate(panel = "old")
+data = smartbind(data, prior_data)
+
+#remove in-progress entries
+data = subset(data, !is.na(Sample))
+
+#mark neutrophilic patients
+data$neutrophilic = factor(ifelse(data$percent_neutrophils >= 50,
+                                  yes = "Neutrophilic",
+                                  no = "Non-Neutrophilic"))
+
+#adjust types
+data$ID = as.character(data$ID)
+data$panel = factor(data$panel)
+```
+
+## Import RNA extraction metadata   
+```{r}
+rna_metadata = read_sheet("https://docs.google.com/spreadsheets/d/15aq9UMRtTl5E75E5M0mXvbFfxVVuJxrXneKYpo6LzlE/edit#gid=897409272",
+                          trim_ws = T,
+                          .name_repair = "universal", 
+                          sheet = "SCRIPT_01 RNAseq Metadata",
+                          na = c("", "NA"))
+#clean up colnames
+colnames(rna_metadata) = gsub("\\.", "_", colnames(rna_metadata)) #I like underscores
+colnames(rna_metadata) = gsub("_+$", "", colnames(rna_metadata)) # remove trailing
+colnames(rna_metadata) = gsub("_+", "_", colnames(rna_metadata)) #remove dup underscores
+#tube is randomly read in as a list. fix this.
+rna_metadata$tubeid_macrophRNA = as.character(rna_metadata$tubeid_macrophRNA)
+rna_metadata$tubeid_macrophRNA[rna_metadata$tubeid_macrophRNA == "NULL"] = NA
+#take out problem cols (added back)
+rna_metadata = rna_metadata %>% 
+  dplyr::select(-c(RNAseq_batch, Batch_sample))
+#remove preceding zeros
+rna_metadata = rna_metadata %>% 
+  mutate_at("tubeid_macrophRNA", function(x){ gsub("^0", "", x) })
+#fix dates
+rna_metadata$sample_process_dt = as.Date(rna_metadata$sample_process_dt)
+
+#merge with flow data
+data$BAL_sample = substring(data$Sample, 10, 20)
+data = left_join(data, 
+                 rna_metadata, 
+                 by = c("BAL_sample" = "tc_pt_study_id"),
+                 na_matches = "never")
+```
+
+
+## Import clinical metadata   
+```{r message=FALSE, warning=FALSE}
+edw_endpoints = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200706 SCRIPT Basic Endpoints.csv",
+                         strip.white = T,
+                         check.names = T,
+                         na.strings = c("", "NA"))
+date_cols = colnames(edw_endpoints)[grepl("date|_dt|_intub_", colnames(edw_endpoints), ignore.case = T)]
+edw_endpoints = edw_endpoints %>%
+  mutate_at(.vars = date_cols,
+            .funs = function(x){
+              as.Date(x, format = "%m/%d/%Y %H:%M", tz = "CST") })
+edw_endpoints$pt_study_id = as.character(edw_endpoints$pt_study_id)
+
+#simplify outcome data
+edw_endpoints$binned_outcome = factor(vapply(edw_endpoints$discharge_disposition_name,
+                                             function(x)
+                                             {
+                                               if(x == "Expired")
+                                               {
+                                                 return("Deceased")
+                                               } else if(grepl("^Home", x))
+                                               {
+                                                 return("Discharged")
+                                               } else if(x %in% c("Acute Care Hospital", "Group Home", "Inpatient Hospice",
+                                                                  "Planned Readmission – DC/transferred to acute inpatient rehab",
+                                                                  "Acute Inpatient Rehabilitation", "Long-Term Acute Care Hospital (LTAC)",
+                                                                  "Skilled Nursing Facility or Subacute Rehab Care"))
+                                               {
+                                                 return("Inpatient Facility")
+                                               } else if(is.na(x) | x == "unknown")
+                                               {
+                                                 return(as.character(NA))
+                                               } else
+                                               {
+                                                 return("Other")
+                                               }}, FUN.VALUE = "char"))
+edw_endpoints = edw_endpoints %>% 
+  select(-full_name)
+
+#add EDW molecular data   
+edw_molecular = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200706 SCRIPT and COVID BAL Results.csv",
+                         na.strings = c("", "NA"),
+                         strip.white = T,
+                         skip = 2,
+                         check.names = T) %>% 
+  select(-Name)
+#make numeric values numeric   
+numeric_cols = c("day_of_intubation", "day_of_hospitalization", "RBC_BODY_FLUID", "WBC__BODY_FLUID", "NEUTROPHILS__BODY_FLUID",
+                 "Absolute_Neutrophils", "TOXIC_GRANULATION", "MACROPHAGE_BF", "MONOCYTE_BF", "LYMPH_BF", 
+                 "ABSOLUTE_LYMPHOCYTES", "EOSINOPHILS__BODY_FLUID", "ABSOLUTE_EOSINOPHILS", "PLASMA_CELL_BF",
+                 "OTHER_CELLS__BODY_FLUID", "AMYLASE_BF", "WHITE_BLOOD_CELL_COUNT", 
+                 "C_Reactive_Protein", "LDH", "CREATINE_KINASE__TOTAL", "PROCALCITONIN", "FERRITIN", "TROPONIN_I",
+                 "Creatinine", "AST__SGOT_", "D_DIMER", "max_daily_temp")
+edw_molecular = edw_molecular %>% mutate_at(.vars = numeric_cols, .funs = function(x){
+  x = gsub(">", "", x)
+  x = gsub("<", "", x)
+  x = gsub(",", "", x)
+  x = as.numeric(x)
+  return(x)})
+#fix test columns
+test_cols = colnames(edw_molecular)[c(which(colnames(edw_molecular) == "ASPERGILLUS_GALACTOMANNAN_ANTIGEN_NMH_LFH_"):which(colnames(edw_molecular) == "RESPIRATORY_SYNCYTIAL_VIRUS_RESPAN22"),
+                                      which(colnames(edw_molecular) == "STREPTOCOCCUS_PNEUMONIAE_ANTIGEN_URINE_1"),
+                                      which(colnames(edw_molecular) == "LEGIONELLA_ANTIGEN__EIA__URINE_1"))]
+
+edw_molecular = edw_molecular %>% mutate_at(.vars = test_cols, 
+                                            .funs = function(x){
+                                              x = factor(ifelse(is.na(x),
+                                                                yes = NA,
+                                                                no = ifelse((grepl("Not Detected", x, ignore.case = T) |
+                                                                               grepl("Negative", x, ignore.case = T)),
+                                                                            yes = "Negative",
+                                                                            no = "Positive")))
+                                              return(x) })
+
+#remove one strange duplicate entry
+edw_molecular = subset(edw_molecular, !(duplicated(edw_molecular$order_accession_num)))
+#format into long form
+edw_molecular = edw_molecular %>% 
+  pivot_longer(cols = contains("organism_"),
+               names_to = "microbiology_parameter",
+               values_to = "microbiology_value") 
+edw_molecular$main_microbiology_parameter = factor(gsub("_*\\d", "", edw_molecular$microbiology_parameter))
+#flatten these parameters into lists of values
+edw_molecular = edw_molecular %>%
+  group_by(ir_id, BAL_order_timestamp, main_microbiology_parameter) %>%
+  mutate(microbiology_value_list = list(microbiology_value)) %>%  # list column
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate_at(.vars = "microbiology_value_list", .funs = function(x){ #remove NA
+    cur = na.omit(x)
+    if(length(cur) == 0)
+    {
+      return(list(NULL))
+    } else
+    {
+      return(list(cur))
+    }
+  }) %>%
+  select(-c(microbiology_parameter, microbiology_value)) %>% 
+  ungroup()
+#pivot back into wide form for merging (list values get duplicated, need to fix)
+listcols = as.character(unique(edw_molecular$main_microbiology_parameter))
+edw_molecular = edw_molecular %>%
+  pivot_wider(names_from = main_microbiology_parameter,
+              values_from = microbiology_value_list) %>% 
+  rowwise() %>% 
+  #have to remove duplicated list vals
+  mutate_at(.vars = listcols, .funs = function(x){ 
+    return(list(x[[1]])) }) %>% 
+  ungroup()
+edw_molecular$order_accession_num = as.character(edw_molecular$order_accession_num)
+#fix dates
+date_cols = colnames(edw_molecular)[grepl("date", colnames(edw_molecular), ignore.case = T)]
+edw_molecular = edw_molecular %>% 
+  mutate_at(.vars = date_cols, .funs = function(x){
+    as.Date(x, format = "%m/%d/%Y", tz = "CST")} )
+#make organism quantity numeric
+edw_molecular$organism_quantity = lapply(edw_molecular$organism_quantity,
+                                         function(x){
+                                           x = gsub(">", "", x)
+                                           x = gsub("<", "", x)
+                                           x = gsub(",", "", x)
+                                           x = as.numeric(x)
+                                           if(length(x) == 0)
+                                           {
+                                             return(NULL)
+                                           }
+                                           return(x)})
+#reformat order timestamps for merging with blood gas
+edw_molecular$BAL_order_timestamp = as.POSIXct(edw_molecular$BAL_order_timestamp,
+                                               format = "%m/%d/%Y %X %p", 
+                                               tz = "America/Chicago")
+
+#import known COVID patients and all patient IDs
+covid_cases = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200714 204.COVID19+.NMH.6.30.csv",
+                         na.strings = c("", "NA"),
+                         strip.white = T,
+                        check.names  = T,
+                       colClasses = rep("character", 8)) %>% 
+  select(-c(admission.datetime, discharge.datetime, X)) %>% 
+  mutate(covid_confirmed = TRUE)  #all of these patients are positive
+
+all_patients = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200706 STU00204868_subjects_07_06_2020.csv",
+                        na.strings = c("", "NA"),
+                        strip.white = T,
+                        check.names = T, 
+                        colClasses = rep("character", 10)) %>% 
+  separate_rows(case.number, sep = ", ")  %>% #uncollapse ID column
+  dplyr::select(-diagnosis)
+
+#import conversion from SCRIPT BAL ID to NMH accession number and add to molecular
+accession_conv = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200721 U19SCRIPTVersion20-AccessionNumberConve_DATA_2020-07-21_2059.csv",
+                          na.strings = c("", "NA", "n/a", "N/A", "na"), 
+                          strip.white = T) %>% 
+  na.omit() %>% 
+  mutate(accession_num = gsub("-", "", accession_num)) %>%  #match destination formatting
+  mutate(study_id = substring(bal_barcode, 1, 4)) %>% 
+  dplyr::filter(grepl("\\d{4}-BAL-\\d{2}", bal_barcode)) %>% #remove bad entries 
+  dplyr::select(bal_barcode, accession_num, study_id) %>% 
+  unique()
+colnames(accession_conv) = c("tc_pt_study_id", "order_accession_num", "study_id")
+accession_conv$order_accession_num = trimws(accession_conv$order_accession_num) #not clear why this is necessary, but it is
+
+edw_molecular = left_join(edw_molecular, accession_conv, by = "order_accession_num",
+                          na_matches = "never")
+
+# some BAL samples do not have entries. Add in from rna metadata and flow
+edw_molecular$script_day = as.numeric(substring(edw_molecular$tc_pt_study_id, 
+                                     nchar(edw_molecular$tc_pt_study_id) - 1)) #useful below
+
+flow_and_bulk = c(rna_metadata$tc_pt_study_id,
+                  data$BAL_sample)
+missing_samples = base::setdiff(flow_and_bulk,
+                                edw_molecular$tc_pt_study_id)
+missing_samples = missing_samples[grepl("\\d{4}-BAL-\\d{2}", missing_samples)]
+missing_sample_df = data.frame(study_id = substring(missing_samples, 1, 4),
+                               tc_pt_study_id = missing_samples)
+missing_sample_df = edw_molecular %>% 
+  mutate(first_bal_date = as.Date(BAL_order_date) - script_day) %>% 
+  dplyr::select(ir_id:hosp_disch_date, study_id, first_bal_date) %>% 
+  dplyr::filter(!is.na(ir_id)) %>% #empties
+  unique() %>% 
+  left_join(missing_sample_df, .,
+            by = "study_id",
+            na_matches = "never") %>% 
+  group_by(study_id) %>% 
+  mutate(first_bal_date = min(first_bal_date)) %>% #at most +/- 1 day
+  ungroup() %>% 
+  unique() %>%
+  mutate(BAL_order_date = first_bal_date + as.numeric(substring(tc_pt_study_id,
+                                                                nchar(tc_pt_study_id) - 1)),
+         day_of_intubation = as.numeric(difftime(BAL_order_date, first_intubation_date, units = "days"))) %>% 
+  select(-first_bal_date)
+edw_molecular = bind_rows(edw_molecular, missing_sample_df)
+
+#import pneumonia diagnosis   
+diagnosis = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200717 U19SCRIPTVersion20-PneumoniaDiagnosis_DATA_2020-07-17_1723.csv", 
+                     na.strings = c("", "NA"),
+                     strip.white = T,
+                     check.names = T) %>% 
+  dplyr::filter(!is.na(pt_category)) %>% 
+  dplyr::select(record_id, pt_category:clin_hap) %>% 
+  mutate(pneu_assess_dt = as.Date(pneu_assess_dt)) %>% 
+  unique()
+record_id_conv = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200706 U19SCRIPTVersion20-RecordIDConversion_DATA_2020-07-06_1731.csv", 
+                          na.strings = c("", "NA"),
+                          strip.white = T,
+                          check.names = T) %>% 
+  dplyr::filter(!is.na(pt_study_id)) %>% 
+  dplyr::select(record_id, pt_study_id) %>% 
+  unique()
+diagnosis_conv = data.frame(pt_category = c(1:4),
+                            diagnosis = factor(c("CAP", "HAP", "VAP", "Non-Pneumonia Control")),
+                            simplified_diagnosis = factor(c(rep("Pneumonia", 3), "Non-Pneumonia Control")))
+diagnosis = full_join(diagnosis, record_id_conv, by = "record_id", na_matches = "never") %>% 
+  left_join(., diagnosis_conv, by = "pt_category", na_matches = "never") %>% 
+  dplyr::select(-record_id) %>% 
+  group_by(pt_study_id) %>% 
+  mutate(study_dates = list(as.character(pneu_assess_dt)), 
+         diagnoses = list(as.character(diagnosis)),
+         simplified_diagnoses = list(as.character(simplified_diagnosis)),
+         pt_categories = list(pt_category),
+         ever_pna = any(simplified_diagnosis == "Pneumonia", na.rm = T)) %>% 
+  ungroup() 
+#all patients with multiple diagnoses go from control --> some type of pneumonia (makes sense)
+#so best practice is probably to code these cases as control for all samples until PNA, then always PNA
+#for patients with multiple PNA types, just always code as PNA (current scheme is to bin all PNA for now)
+#for patients with 1 diagnosis, just pick all BAL
+pts = c()
+assoc_bal = c()
+simp = c()
+for(patient in unique(diagnosis$pt_study_id))
+{
+  diagnoses = subset(diagnosis, pt_study_id == patient)$diagnosis
+  
+  #for consistent pna patients, link all samples
+  if(!("Non-Pneumonia Control" %in% diagnoses))
+  {
+    bal_samples = subset(edw_molecular, study_id == patient)$tc_pt_study_id
+    pts = append(pts, rep(patient, length(bal_samples)))
+    simp = append(simp, rep("Pneumonia", length(bal_samples)))
+    assoc_bal = append(assoc_bal, bal_samples)
+  } else #i.e. if at least one control diagnosis
+  {
+    if(length(diagnoses) == 1)
+    {
+      bal_samples = subset(edw_molecular, study_id == patient)$tc_pt_study_id
+      pts = append(pts, rep(patient, length(bal_samples)))
+      simp = append(simp, rep("Non-Pneumonia Control", length(bal_samples)))
+      assoc_bal = append(assoc_bal, bal_samples)
+    } else #split by diagnosis date. May be hazy in the middle, but still better
+    {
+      first_pna = min(subset(diagnosis, pt_study_id == patient & diagnosis != "Non-Pneumonia Control")$pneu_assess_dt)
+      control_bal_samples = subset(edw_molecular, study_id == patient & BAL_order_date < first_pna)$tc_pt_study_id
+      pna_bal_samples = subset(edw_molecular, study_id == patient & BAL_order_date >= first_pna)$tc_pt_study_id
+      pts = append(pts, rep(patient, (length(control_bal_samples) + length(pna_bal_samples))))
+      simp = append(simp, c(rep("Non-Pneumonia Control", length(control_bal_samples)),
+                            rep("Pneumonia", length(pna_bal_samples))))
+      assoc_bal = append(assoc_bal, c(control_bal_samples, pna_bal_samples))
+    }
+  }
+}
+bal_diagnoses = data.frame(pt_study_id = pts,
+                           simplified_diagnosis = simp,
+                           tc_pt_study_id = assoc_bal)
+
+#for rendering unique patients for stats later
+diagnosis_for_pt_data = diagnosis %>% 
+  dplyr::select(-c(diagnosis, pt_category, pneu_assess_dt, simplified_diagnosis)) %>% 
+  unique() %>% 
+  dplyr::filter(!duplicated(pt_study_id)) #unique doesn't work on list cols
+
+covid_cases$clarity.west.mrn = as.character(covid_cases$clarity.west.mrn)
+patient_data = full_join(covid_cases,
+                         all_patients,
+                         by = c("clarity.west.mrn" = "nmhc_record_number"),
+                         na_matches = "never") %>% 
+  mutate(case.number = as.integer(case.number)) %>% 
+  select(-c(first.name.x, first.name.y, last.name.x, last.name.y, address.line.1:email, nmff_record_number, nmh_record_number, ir.id))
+colnames(patient_data)[colnames(patient_data) == "case.number"] = "study_id"
+#add others past Lorenzo's cutoff
+patient_data$covid_confirmed[patient_data$study_id == 1304] = TRUE
+
+diagnosis = diagnosis %>% 
+  dplyr::select(-c(diagnoses, study_dates, simplified_diagnoses, pt_categories, ever_pna, pneu_assess_dt)) %>% 
+  dplyr::select(-c(diagnosis, pt_category)) %>%  #keep only simple (other data preserved later)
+  left_join(., bal_diagnoses) %>% 
+  unique()
+#bind with molecular
+diagnosis$pt_study_id = as.character(diagnosis$pt_study_id)
+edw_molecular = left_join(edw_molecular, 
+                          diagnosis,
+                          by = c("study_id" = "pt_study_id",
+                                 "tc_pt_study_id"),
+                          na_matches = "never")
+
+#import smoker status data
+smoking_codes = data.frame(pt_smoker = c(0, 1, 2),
+                           smoking_status = factor(c("Never Smoker", "Current Smoker", "Past Smoker")))
+smoking_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200706 U19SCRIPTVersion20-SmokerStatus_DATA_2020-07-06_1732.csv",
+                        na.strings = c("", "NA", "n/a", "N/A", "na"),
+                        strip.white = T) %>% 
+  mutate(pt_study_id = as.character(pt_study_id)) %>% 
+  dplyr::filter(!is.na(pt_study_id)) %>% 
+  left_join(., smoking_codes, by = "pt_smoker", na_matches = "never")
+smoking_data$pack_years = ifelse(smoking_data$smoking_status == "Past Smoker",
+                                 yes = smoking_data$former_smoke_pk_yrs,
+                                 no = (smoking_data$smoke_pk_day * smoking_data$smoke_years))
+edw_endpoints = left_join(edw_endpoints, smoking_data, by = "pt_study_id",
+                          na_matches = "never")
+
+#import BMI data   
+bmi_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200706 SCRIPT BMI data.csv",
+                    na.strings = c("", "NA", "n/a", "N/A", "na"),
+                    strip.white = T)
+
+#import SOFA scores
+#also includes unique stays!
+sofa_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200705 SCRIPT Serial SOFA Score.csv",
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na"))
+date_cols = setdiff(colnames(sofa_data)[grepl("date|day|dt", colnames(sofa_data), ignore.case = T)],
+                    c("ICU_Day"))
+sofa_data = sofa_data %>% 
+  mutate_at(.vars = date_cols, .funs = function(x){ as.Date(x, format = "%m/%d/%Y", tz = "CST") }) %>% 
+  dplyr::select(-c(MRN, admission_datetime, discharge_datetime)) #remove duplicates
+
+aps_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200705 SCRIPT Serial APS Score.csv",
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na"))
+date_cols = setdiff(colnames(aps_data)[grepl("date|day|dt", colnames(aps_data), ignore.case = T)],
+                    c("icu_day"))
+aps_data = aps_data %>% 
+  mutate_at(.vars = date_cols, .funs = function(x){ as.Date(x, format = "%m/%d/%Y", tz = "CST") }) %>% 
+  dplyr::select(-c(MRN, admission_datetime, discharge_datetime)) #remove duplicates
+
+#actually can allow NA matches here
+sofa_data = full_join(sofa_data, 
+                      suffix = c("_SOFA", "_APS"),
+                      aps_data,
+                      by = c("pt_study_id", "icu_rank",
+                             "icu_start_dt", "icu_stop_dt", "day_bucket_starts", "day_bucket_ends", 
+                             "bilirubin", "creatinine", "visit_id" = "visit_key", "ICU_Day" = "icu_day"), )
+
+#join by date range for each associated BAL
+merge_dates = data.frame(pt_study_id = c(),
+                         visit_id = c(),
+                         ICU_Day = c(),
+                         day_bucket_starts = c(),
+                         day_bucket_ends = c(),
+                         merge_date = c())
+for(i in 1:nrow(sofa_data))
+{
+  pt = sofa_data$pt_study_id[i]
+  visit = sofa_data$visit_id[i]
+  ICU_Day = sofa_data$ICU_Day[i]
+  min_date = sofa_data$day_bucket_starts[i]
+  max_date = sofa_data$day_bucket_ends[i]
+  cor_BAL = subset(edw_molecular, study_id == pt &
+                     BAL_order_date >= min_date &
+                     BAL_order_date <= max_date)
+  rows_out = data.frame(pt_study_id = rep(pt, nrow(cor_BAL)),
+                        visit_id = rep(visit, nrow(cor_BAL)),
+                        ICU_Day = rep(ICU_Day, nrow(cor_BAL)),
+                        day_bucket_starts = rep(min_date, nrow(cor_BAL)),
+                        day_bucket_ends = rep(max_date, nrow(cor_BAL)),
+                        merge_date = cor_BAL$BAL_order_date)
+  merge_dates = rbind(merge_dates, rows_out)
+}
+sofa_data_for_edw_molecular = left_join(sofa_data, merge_dates) #for merging into total metadata, any downstream
+#join with patient data without duplicating data
+#and isolate first score
+sofa_data_for_patient_data = sofa_data %>% 
+  dplyr::select(-enrollment_dt1) %>% 
+  arrange(pt_study_id, visit_id, icu_rank, ICU_Day) %>% 
+  group_by(pt_study_id, visit_id) %>%
+  mutate(earliest_sofa = SOFA[1], 
+         mean_sofa = mean(SOFA, na.rm = T),
+         median_sofa = median(SOFA, na.rm = T),
+         earliest_aps = total_APS_score_num[1], 
+         mean_aps = mean(total_APS_score_num, na.rm = T), 
+         median_aps = median(total_APS_score_num, na.rm = T)) %>% 
+  ungroup() %>% 
+  nest(icu_rank:total_APS_score_num)
+#merge with patient data
+patient_data = left_join(patient_data, 
+                         sofa_data_for_patient_data,
+                         by = c("study_id" = "pt_study_id"),
+                         na_matches = "never")
+
+#import ventilator settings   
+vent_settings = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200718 Ventilator settings.csv",
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na")) %>% 
+  dplyr::select(ir_id, meas_date, disp_name, meas_value) %>% 
+  mutate(meas_date = as.Date(meas_date, format = "%m/%d/%Y", tz = "CST")) %>% 
+  pivot_wider(names_from = disp_name, 
+              values_from = meas_value, 
+              names_repair = "universal")
+numeric_cols = colnames(vent_settings)[c(3:12, 14)]
+vent_settings = vent_settings %>%
+  mutate_at(.vars = numeric_cols, .funs = as.numeric) %>% #fix non-numeric cols
+  mutate(driving_pressure = Plateau.Pressure - PEEP)
+#make single IBW/kg column
+vent_settings$IBW_kg = ifelse(is.na(vent_settings$IBW.kg..Calculated..MALE),
+                               yes = vent_settings$IBW.kg..Calculated..FEMALE,
+                               no = vent_settings$IBW.kg..Calculated..MALE)
+
+#import blood gases
+blood_gas = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200721 NMH COVID pos ventilated or SCRIPT patient blood gases.csv",
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na")) %>% 
+  dplyr::select(ir_id, order_datetime, NAME, value_numeric) %>% 
+  mutate(order_datetime = as.POSIXct(order_datetime, format = "%m/%d/%Y %X %p", tz = "America/Chicago")) %>% 
+  pivot_wider(names_from = NAME, 
+              values_from = value_numeric, 
+              names_repair = "universal",
+              values_fn = mean)
+#determine closest realistic BAL order date (if any)   
+#setting a max of 24hrs for now
+blood_gas$merge_datetime = NA
+for(i in 1:nrow(edw_molecular))
+{
+  cur_bal = edw_molecular[i, ]
+  possible_bloodgas = blood_gas %>% 
+    dplyr::filter(ir_id == cur_bal$ir_id) %>% 
+    mutate(timediff = difftime(cur_bal$BAL_order_timestamp, order_datetime, tz = "America/Chicago", units = "hours")) %>% 
+    dplyr::filter(timediff < 24 & timediff >= 0)
+  if(nrow(possible_bloodgas) == 0)
+  {
+    blood_gas$merge_datetime[i] = NA
+  } else
+  {
+    closest = possible_bloodgas[which.min(possible_bloodgas$timediff), ]
+    blood_gas$merge_datetime[blood_gas$ir_id == closest$ir_id & blood_gas$order_datetime == closest$order_datetime] = as.character(cur_bal$BAL_order_timestamp)
+  }
+}
+blood_gas$merge_datetime = as.POSIXct(blood_gas$merge_datetime, tz = "America/Chicago")
+
+#merge metadata
+edw_molecular$ir_id = as.character(edw_molecular$ir_id)
+edw_endpoints$ir_id = as.character(edw_endpoints$ir_id)
+bmi_data$ir_id = as.character(bmi_data$ir_id)
+patient_data$study_id = as.character(patient_data$study_id)
+sofa_data_for_edw_molecular$pt_study_id = as.character(sofa_data_for_edw_molecular$pt_study_id)
+edw_molecular$MRN = as.character(edw_molecular$MRN)
+vent_settings$ir_id = as.character(vent_settings$ir_id)
+blood_gas$ir_id = as.character(blood_gas$ir_id)
+total_metadata = full_join(edw_molecular, 
+                           subset(patient_data, !is.na(study_id)),
+                           by = c("study_id"), 
+                           na_matches = "never") %>%
+  select(-c(MRN)) %>% 
+  full_join(.,
+            edw_endpoints,
+            by = c("ir_id", "study_id" = "pt_study_id"),
+            na_matches = "never") %>% 
+  select(-west_mrn) %>% 
+  left_join(., bmi_data, by = "ir_id", na_matches = "never") %>% 
+  left_join(., vent_settings, by = c("ir_id", "BAL_order_date" = "meas_date"), na_matches = "never")  %>% 
+  left_join(., blood_gas, by = c("ir_id", "BAL_order_timestamp" = "merge_datetime"), na_matches = "never")
+
+#fix colnames
+colnames(data) = gsub("\\.", "_", colnames(data)) #I like underscores
+colnames(data) = gsub("_+$", "", colnames(data)) # remove trailing
+colnames(data) = gsub("^_+", "", colnames(data)) # remove leading
+colnames(data) = gsub("_+", "_", colnames(data)) #remove dup underscores
+colnames(total_metadata) = gsub("\\.", "_", colnames(total_metadata)) 
+colnames(total_metadata) = gsub("_+$", "", colnames(total_metadata)) 
+colnames(total_metadata) = gsub("^_+", "", colnames(total_metadata))
+colnames(total_metadata) = gsub("_+", "_", colnames(total_metadata))
+   
+#add in healthy controls, which have no associated metadata
+#no need to clean this as I put it together
+healthy_metadata = read.csv("~/Box/RGrant/SCRIPT/200717_healthy_control_metadata.csv",
+                            colClasses = c("character", "character", "numeric",
+                                           "character", "logical", "character",
+                                           "character", "character"))
+total_metadata = bind_rows(total_metadata, healthy_metadata)
+
+#derive additional metadata
+total_metadata$PF_ratio = total_metadata$PO2_ART / total_metadata$FiO2
+total_metadata$days_from_death = as.numeric(difftime(total_metadata$BAL_order_date, total_metadata$death_date, units = "days"))
+total_metadata$covid_confirmed[is.na(total_metadata$covid_confirmed)] = FALSE #may be a safer way to do this
+total_metadata$covid_confirmed = factor(total_metadata$covid_confirmed)
+total_metadata$day_of_intubation = as.numeric(difftime(total_metadata$BAL_order_date, total_metadata$first_intubation_date, units = "days"))
+total_metadata$days_intube_prior_enroll_redcap[total_metadata$days_intube_prior_enroll_redcap > 100] = Inf
+total_metadata$days_intube_prior_enroll_redcap[is.na(total_metadata$days_intube_prior_enroll_redcap)] = 0
+total_metadata$day_of_intubation = total_metadata$day_of_intubation + total_metadata$days_intube_prior_enroll_redcap
+total_metadata$age = ifelse(!is.na(total_metadata$birth_date),
+                            yes = time_length(difftime(total_metadata$BAL_order_date, 
+                                                       total_metadata$birth_date), unit = "years"),
+                            no = total_metadata$age)
+
+total_metadata$any_iav = (total_metadata$INFLUENZA_A == "Positive" | 
+                            total_metadata$INFLUENZA_A_RESPAN23 == "Positive" | 
+                            total_metadata$INFLUENZA_A_H3_SEASONAL == "Positive" | 
+                            total_metadata$INFLUENZA_A_H1_SEASONAL == "Positive" | 
+                            total_metadata$INFLUENZA_A_H1_2009 == "Positive")
+total_metadata$any_iav[is.na(total_metadata$any_iav)] = FALSE
+
+total_metadata$any_ibv = (total_metadata$INFLUENZA_B == "Positive" | 
+                            total_metadata$INFLUENZA_B_RESPAN21 == "Positive")
+total_metadata$any_ibv[is.na(total_metadata$any_ibv)] = FALSE
+
+total_metadata$any_influenza = (total_metadata$INFLUENZA_A == "Positive" | 
+                                  total_metadata$INFLUENZA_A_RESPAN23 == "Positive" | 
+                                  total_metadata$INFLUENZA_A_H3_SEASONAL == "Positive" | 
+                                  total_metadata$INFLUENZA_A_H1_SEASONAL == "Positive" | 
+                                  total_metadata$INFLUENZA_A_H1_2009 == "Positive" | 
+                                  total_metadata$INFLUENZA_B_RESPAN21 == "Positive" |
+                                  total_metadata$INFLUENZA_B == "Positive" |
+                                  total_metadata$INFLUENZA_B_RESPAN21 == "Positive")
+total_metadata$any_influenza[is.na(total_metadata$any_influenza)] = FALSE
+
+total_metadata$any_bacterial = (total_metadata$ENTEROBACTER_AEROGENES == "Positive" |
+                                  total_metadata$ENTEROBACTER_CLOACAE_COMPLEX == "Positive" |
+                                  total_metadata$ESCHERICHIA_COLI == "Positive" |
+                                  total_metadata$HAEMOPHILUS_INFLUENZAE == "Positive" |
+                                  total_metadata$KLEBSIELLA_AEROGENES == "Positive" |
+                                  total_metadata$KLEBSIELLA_PNEUMONIAE_GROUP == "Positive" |
+                                  total_metadata$PSEUDOMONAS_AERUGINOSA == "Positive" |
+                                  total_metadata$SERRATIA_MARCESCENS == "Positive" |
+                                  total_metadata$STAPHYLOCOCCUS_AUREUS == "Positive" |
+                                  total_metadata$STREPTOCOCCUS_AGALACTIAE == "Positive" |
+                                  total_metadata$STREPTOCOCCUS_PNEUMONIAE_ANTIGEN_URINE_1 == "Positive" |
+                                  total_metadata$STREPTOCOCCUS_PNEUMONIAE == "Positive" |
+                                  total_metadata$STREPTOCOCCUS_PYOGENES == "Positive" |
+                                  total_metadata$MECA_C_AND_MREJ == "Positive" |
+                                  total_metadata$ACINETOBACTER_CALCOACETICUS_BAUMANNII_COMPLEX == "Positive" |
+                                  total_metadata$KLEBSIELLA_OXYTOCA == "Positive" |
+                                  total_metadata$PROTEUS_SPP == "Positive" |
+                                  total_metadata$SERRATIA_MARCESCENS == "Positive" |
+                                  total_metadata$PSEUDOMONAS_AERUGINOSA == "Positive" |
+                                  total_metadata$HAEMOPHILUS_INFLUENZAE == "Positive" |
+                                  total_metadata$CHLAMYDIA_PNEUMONIAE_lower_resp == "Positive" |
+                                  total_metadata$MYCOPLASMA_PNEUMONAIE == "Positive" |
+                                  total_metadata$MORAXELLA_CATARRHALIS == "Positive" |
+                                  total_metadata$LEGIONALLA_PNEUMOPHILIA == "Positive" |
+                                  total_metadata$BORDETELLA_PARAPERTUSSIS == "Positive" |
+                                  total_metadata$BORDETELLA_PERTUSSIS == "Positive" |
+                                  total_metadata$CHLAMYDIA_PNEUMONIAE == "Positive" |
+                                  total_metadata$MYCOPLASMA_PNEUMONIAE == "Positive" |
+                                  total_metadata$STREPTOCOCCUS_PNEUMONIAE_ANTIGEN_URINE_1 == "Positive" |
+                                  total_metadata$LEGIONELLA_ANTIGEN_EIA_URINE_1 == "Positive")
+total_metadata$any_bacterial[is.na(total_metadata$any_bacterial)] = FALSE
+
+total_metadata$any_fungal = (total_metadata$ASPERGILLUS_GALACTOMANNAN_ANTIGEN_NMH_LFH == "Positive" |
+                               total_metadata$PNEUMOCYSTIS_JIROVECII_CARINII_DFA_NMH_LFH == "Positive")
+total_metadata$any_fungal[is.na(total_metadata$any_fungal)] = FALSE
+
+total_metadata$any_parainfluenza = (total_metadata$PARAINFLUENZAE_VIRUS == "Positive" |
+                                      total_metadata$PARA_INFLU_1 == "Positive" |
+                                      total_metadata$PARA_INFLU_2 == "Positive" |
+                                      total_metadata$PARA_INFLU_3 == "Positive" |
+                                      total_metadata$PARAINFLUENZA_VIRUS_4 == "Positive")
+total_metadata$any_parainfluenza[is.na(total_metadata$any_parainfluenza)] = FALSE
+
+total_metadata$any_coronavirus_non_covid = (total_metadata$CORONAVIRUS_HKU1 == "Positive" |
+                                              total_metadata$CORONAVIRUS_229E == "Positive" |
+                                              total_metadata$CORONAVIRUS_NL63 == "Positive" |
+                                              total_metadata$CORONAVIRUS_OC43 == "Positive")
+total_metadata$any_coronavirus_non_covid[is.na(total_metadata$any_coronavirus_non_covid)] = FALSE
+
+total_metadata$any_adenovirus = (total_metadata$ADENOVIRUS_RVPDMB == "Positive" |
+                                   total_metadata$ADENOVIRUS == "Positive")
+total_metadata$any_adenovirus[is.na(total_metadata$any_adenovirus)] = FALSE
+
+total_metadata$any_rsv = (total_metadata$RESPIRATORY_SYNCYTIAL_VIRUS == "Positive" |
+                            total_metadata$RESPIRATORY_SYNCYTIAL_VIRUS_RESPAN22 == "Positive")
+total_metadata$any_rsv[is.na(total_metadata$any_rsv)] = FALSE
+
+total_metadata$any_metapneumonia = (total_metadata$HUMAN_METAPNEUMOVIRUS_lower_resp == "Positive" |
+                                      total_metadata$HUMAN_METAPNEUMOVIRUS == "Positive")
+total_metadata$any_metapneumonia[is.na(total_metadata$any_metapneumonia)] = FALSE
+
+total_metadata$any_rhinovirus_enterovirus = (total_metadata$HUMAN_RHINOVIRUS_ENTEROVIRUS_lower_resp == "Positive" |
+                                               total_metadata$HUMAN_RHINOVIRUS_ENTEROVIRUS == "Positive")
+total_metadata$any_rhinovirus_enterovirus[is.na(total_metadata$any_rhinovirus_enterovirus)] = FALSE
+
+total_metadata$any_viral = (total_metadata$any_influenza |
+                              total_metadata$any_adenovirus |
+                              total_metadata$any_parainfluenza |
+                              total_metadata$any_coronavirus_non_covid |
+                              total_metadata$any_rsv |
+                              total_metadata$any_metapneumonia |
+                              total_metadata$any_rhinovirus_enterovirus |
+                              total_metadata$covid_confirmed == TRUE)
+total_metadata$any_viral[is.na(total_metadata$any_viral)] = FALSE
+
+total_metadata$any_viral_non_covid = (total_metadata$any_influenza |
+                              total_metadata$any_adenovirus |
+                              total_metadata$any_parainfluenza |
+                              total_metadata$any_coronavirus_non_covid |
+                              total_metadata$any_rsv |
+                              total_metadata$any_metapneumonia |
+                              total_metadata$any_rhinovirus_enterovirus)
+total_metadata$any_viral_non_covid[is.na(total_metadata$any_viral_non_covid)] = FALSE
+
+total_metadata = total_metadata %>% 
+  rowwise() %>% 
+  mutate(any_culture = !is.null(organism_name)) %>% 
+  ungroup()
+
+total_metadata$any_nonviral = (total_metadata$any_bacterial |
+                                 total_metadata$any_fungal |
+                                 total_metadata$any_culture)
+total_metadata$any_nonviral[is.na(total_metadata$any_nonviral)] = FALSE
+
+#factor by major pathogen
+major_pathogen_cols = c("any_viral_non_covid", "any_bacterial", 
+                        "any_fungal", "covid_confirmed")
+pathogen = vector(mode = "character", length = nrow(total_metadata))
+pathogens_list = vector(mode = "list", length = nrow(total_metadata))
+for(i in 1:nrow(total_metadata))
+{
+  cur = total_metadata[i, major_pathogen_cols]
+  pathogens = as.character(na.omit(colnames(cur)[cur == TRUE]))
+  pathogens = gsub("^any_", "", pathogens)
+  pathogens = gsub("covid_confirmed", "SARS-CoV-2", pathogens)
+  if(length(pathogens) == 0)
+  {
+    pathogen[i] = NA
+  } else if(length(pathogens) > 0)
+  {
+    pathogens_list[[i]] = pathogens
+    if(length(pathogens) == 1)
+    {
+      pathogen[i] = pathogens
+    } else
+    {
+      pathogen[i] = "multiple"
+    }
+  }
+}
+pathogen = factor(pathogen)
+total_metadata$pathogen = pathogen
+total_metadata$pathogen_list = pathogens_list
+
+#factor by infection type
+pathogen_type_cols = c("any_bacterial", "any_fungal", "any_viral")
+pathogen = vector(mode = "character", length = nrow(total_metadata))
+pathogens_list = vector(mode = "list", length = nrow(total_metadata))
+for(i in 1:nrow(total_metadata))
+{
+  cur = total_metadata[i, pathogen_type_cols]
+  pathogens = as.character(na.omit(colnames(cur)[cur == TRUE]))
+  pathogens = gsub("^any_", "", pathogens)
+  if(length(pathogens) == 0)
+  {
+    pathogen[i] = NA
+  } else if(length(pathogens) > 0)
+  {
+    pathogens_list[[i]] = pathogens
+    if(length(pathogens) == 1)
+    {
+      pathogen[i] = pathogens
+    } else
+    {
+      pathogen[i] = "multiple"
+    }
+  }
+}
+pathogen = factor(pathogen)
+total_metadata$infection_type = pathogen
+total_metadata$infection_type_list = pathogens_list
+
+#remove comensal from detected orgs / levels
+#fix ws
+for(i in 1:nrow(total_metadata))
+{
+  if(is.null(total_metadata$organism_name[[i]]))
+  {
+       next
+  }
+  total_metadata$organism_name[[i]] = trimws(total_metadata$organism_name[[i]])
+}
+all_pathogens = unique(unlist(total_metadata$organism_name))
+comensal = c("Yeast, Not Cryptococcus Species", "Corynebacterium species", 
+             "Stomatococcus species", "Yeast, Not Cryptococcus Species",
+             "Lactobacillus species", "Yeast, Not Cryptococcus Species #2",
+             "Lactobacillus species #2", all_pathogens[grepl("Candida", all_pathogens)])
+for(i in 1:nrow(total_metadata))
+{
+  cur_name = total_metadata$organism_name[i][[1]]
+  cur_quantity = total_metadata$organism_quantity[i][[1]]
+  cur_abbreviation = total_metadata$Organism_ID[i][[1]]
+  if(is.null(cur_name))
+  {
+    next
+  }
+  good_indices = which(!(cur_name %in% comensal))
+  if(is.null(cur_name[good_indices]))
+  {
+    total_metadata$organism_name[i][[1]] = NULL
+    total_metadata$organism_quantity[i][[1]] = NULL
+    total_metadata$Organism_ID[i][[1]] = NULL
+  } else
+  {
+    total_metadata$organism_name[i][[1]] = cur_name[good_indices]
+    total_metadata$organism_quantity[i][[1]] = cur_quantity[good_indices]
+    total_metadata$Organism_ID[i][[1]] = cur_abbreviation[good_indices]
+  }
+}
+
+#add broad diagnosis
+final_diagnosis = vector(mode = "character", length = nrow(total_metadata))
+for(i in 1:nrow(total_metadata))
+{
+  #no matter what, this stays the same (even with COVID)
+  if(!is.na(total_metadata$simplified_diagnosis[i]) && total_metadata$simplified_diagnosis[i] == "Non-Pneumonia Control")
+  {
+    final_diagnosis[i] = "Non-Pneumonia Control"
+  } else if(!is.na(total_metadata$simplified_diagnosis[i]) && total_metadata$simplified_diagnosis[i] == "Healthy Control")
+  {
+    final_diagnosis[i] = "Healthy Control"
+  } else if(total_metadata$covid_confirmed[i] == TRUE) #even if NA
+  {
+    final_diagnosis[i] = "COVID-19"
+  } else if(is.na(total_metadata$simplified_diagnosis[i]))
+  {
+    final_diagnosis[i] = NA
+  } else if(total_metadata$simplified_diagnosis[i] == "Pneumonia") #determine if viral
+  {
+    if(total_metadata$any_viral_non_covid[i] == TRUE || 
+       (!is.na(total_metadata$clin_cap[i]) && total_metadata$clin_cap[i] %in% c(2,4)) ||
+       (!is.na(total_metadata$clin_hap[i]) && total_metadata$clin_hap[i] == 4) ||
+       (!is.na(total_metadata$clin_vap[i]) && total_metadata$clin_vap[i] == 4))
+    {
+      final_diagnosis[i] = "Other Viral Pneumonia"
+    } else
+    {
+      final_diagnosis[i] = "Other Pneumonia"
+    }
+  } else
+  {
+    final_diagnosis[i] = NA
+  }
+}
+final_diagnosis = factor(final_diagnosis,
+                         levels = c("Healthy Control", "Non-Pneumonia Control", "COVID-19", 
+                                    "Other Viral Pneumonia", "Other Pneumonia"))
+total_metadata$pna_type = final_diagnosis
+
+#remove extra diagnosis cols
+total_metadata = total_metadata %>% 
+  dplyr::select(-c("clin_cap", "clin_vap", "clin_hap")) %>% 
+  unique()
+
+#remove any remaining PHI
+total_metadata = total_metadata %>% 
+  select(-c(clarity_west_mrn, birth_date))
+
+#spot fixes for incorrect entries
+total_metadata$binned_outcome[total_metadata$study_id == 1196] = "Death"
+  
+#merge with flow data
+data = data %>% 
+  mutate(tc_pt_study_id = substring(Sample, 10, 20)) %>% 
+  left_join(.,
+            total_metadata,
+            by = c("ID" = "study_id", "tc_pt_study_id"),
+            na_matches = "never")
+
+#add extra columns
+data = data %>% 
+  rowwise() %>% 
+  mutate(infection_detected = factor(!is.null(organism_quantity))) %>% 
+  ungroup()
+
+#cast into long form
+data = unique(data)
+mfi_cols = colnames(data)[grepl("MFI", colnames(data), ignore.case = T)]
+percentage_cols = colnames(data)[grepl("percent", colnames(data), ignore.case = T)]
+data_long = data %>% 
+  pivot_longer(cols = c(mfi_cols, percentage_cols), 
+               names_to = "flow_parameter",
+               values_to = "value") %>% 
+  arrange(ID, day_of_intubation) #for easy viewing later
+data_long$flow_parameter = factor(data_long$flow_parameter)
+
+#output for use with bulk
+outname = paste0("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/",
+                 Sys.Date(),
+                 "_",
+                 "SCRIPT_clinical_metadata_processed.rds")
+
+#make separate item for only patients with BAL data
+only_metadata = subset(total_metadata, !is.na(tc_pt_study_id))
+
+saveRDS(object = only_metadata,
+        file = outname)
+outname = paste0("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/",
+                 Sys.Date(),
+                 "_",
+                 "SCRIPT_flow_plus_clinical_metadata_processed.rds")
+saveRDS(object = data,
+        file = outname)
+
+#for subsetting later
+data = unique(data) %>% 
+  dplyr::filter(!duplicated(Sample)) #some must have duplicate barcodes
+observations = table(data$patient_id)
+serial_patients = names(observations[observations > 1])
+
+#add finite days
+data$finite_day_of_intubation = data$day_of_intubation
+data$finite_day_of_intubation[is.infinite(data$finite_day_of_intubation)] = NA
+
+data
+```
+
+### Sanity checks   
+```{r}
+all(only_metadata$ir_id[is.na(only_metadata$C_Reactive_Protein)] %in% edw_molecular$ir_id[is.na(edw_molecular$C_Reactive_Protein)])
+setdiff(only_metadata$ir_id[is.na(only_metadata$C_Reactive_Protein)],
+        edw_molecular$ir_id[is.na(edw_molecular$C_Reactive_Protein)])
+```   
+
+```{r}
+ggplot(data, aes(x = percent_total_CD206_low, y = percent_neutrophils, color = panel)) +
+  geom_point() +
+  stat_smooth(method = "lm")
+```
+
+# Code patients as presumed pneumonia or control   
+## Pull data together   
+```{r eval=FALSE}
+any_positive_test = function(x)
+{
+  return(any(x == "Positive", na.rm = T))
+}
+adjudication_data = total_metadata %>% 
+  dplyr::select(study_id, tc_pt_study_id, clarity_west_mrn, day_of_intubation, organism_name, covid_confirmed,
+                ASPERGILLUS_GALACTOMANNAN_ANTIGEN_NMH_LFH, PNEUMOCYSTIS_JIROVECII_CARINII_DFA_NMH_LFH, 
+                STAPHYLOCOCCUS_AUREUS, MECA_C_AND_MREJ, STREPTOCOCCUS_AGALACTIAE, STREPTOCOCCUS_PNEUMONIAE, 
+                STREPTOCOCCUS_PYOGENES, ACINETOBACTER_CALCOACETICUS_BAUMANNII_COMPLEX, OXA_48_LIKE, ENTEROBACTER_AEROGENES, 
+                ENTEROBACTER_CLOACAE_COMPLEX, ESCHERICHIA_COLI, KLEBSIELLA_AEROGENES, KLEBSIELLA_OXYTOCA, 
+                KLEBSIELLA_PNEUMONIAE_GROUP, PROTEUS_SPP, SERRATIA_MARCESCENS, CTX_M, KPC, NDM, PSEUDOMONAS_AERUGINOSA, IMP, VIM,
+                HAEMOPHILUS_INFLUENZAE, CHLAMYDIA_PNEUMONIAE_lower_resp, MYCOPLASMA_PNEUMONAIE, MORAXELLA_CATARRHALIS,
+                LEGIONALLA_PNEUMOPHILIA, CORONAVIRUS, ADENOVIRUS, HUMAN_METAPNEUMOVIRUS_lower_resp,
+                HUMAN_RHINOVIRUS_ENTEROVIRUS_lower_resp, INFLUENZA_A, INFLUENZA_B, PARAINFLUENZAE_VIRUS,
+                RESPIRATORY_SYNCYTIAL_VIRUS, INFLUENZA_A_RESPAN23, INFLUENZA_A_H3_SEASONAL, INFLUENZA_A_H1_SEASONAL,
+                INFLUENZA_A_H1_2009,INFLUENZA_B_RESPAN21, CORONAVIRUS_229E, CORONAVIRUS_HKU1, CORONAVIRUS_NL63, 
+                CORONAVIRUS_OC43, HUMAN_METAPNEUMOVIRUS, PARA_INFLU_1, PARA_INFLU_2, PARA_INFLU_3, PARAINFLUENZA_VIRUS_4,
+                BORDETELLA_PERTUSSIS, BORDETELLA_PARAPERTUSSIS, CHLAMYDIA_PNEUMONIAE, ADENOVIRUS_RVPDMB,
+                HUMAN_RHINOVIRUS_ENTEROVIRUS, MYCOPLASMA_PNEUMONIAE, RESPIRATORY_SYNCYTIAL_VIRUS_RESPAN22,
+                STREPTOCOCCUS_PNEUMONIAE_ANTIGEN_URINE_1, LEGIONELLA_ANTIGEN_EIA_URINE_1) %>% 
+  #flag any positive test cols
+  rowwise() %>% 
+  mutate(any_pos_test = any_positive_test(c_across(ASPERGILLUS_GALACTOMANNAN_ANTIGEN_NMH_LFH:LEGIONELLA_ANTIGEN_EIA_URINE_1))) %>%
+  mutate(any_pos_culture = !is.null(organism_name)) %>% 
+  ungroup() %>% 
+  mutate(putative_pneumonia = (any_pos_culture == TRUE |
+                                 covid_confirmed == TRUE |
+                                 any_pos_test == TRUE))
+
+boolean_cols = c("covid_confirmed","any_pos_test", 
+                 "any_pos_culture", "putative_pneumonia")
+adjudication_summary = adjudication_data %>% 
+  dplyr::select(study_id, clarity_west_mrn, covid_confirmed, 
+                any_pos_test, any_pos_culture, putative_pneumonia) %>% 
+  dplyr::filter(!is.na(study_id) & !is.na(clarity_west_mrn)) %>% 
+  group_by(study_id) %>% 
+  mutate_at(.var = boolean_cols, .funs = function(x){ any(x == TRUE) }) %>% 
+  unique()
+write.csv(adjudication_summary, "~/Box/RGrant/SCRIPT/200626_adjudication_data.csv")
+```
+
+
+# Patient timelines   
+## Prepare data   
+```{r}
+#import symptom onset data
+symptom_onset = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200625 SCRPT_symptoms.xlsx",
+                           na = c("", "NA", "n/a", "N/A", "na"),
+                           trim_ws = T,
+                           .name_repair = "universal") %>% 
+  separate_rows(case_number, sep = ", ") %>% #uncollapse ID column
+  select(case_number, condition_concept_name, condition_start_date)
+symptom_onset$case_number = as.character(symptom_onset$case_number)
+symptom_onset$condition_concept_name = factor(symptom_onset$condition_concept_name)
+symptom_onset$condition_start_date = as.Date(symptom_onset$condition_start_date)
+
+#get other dates first
+col_classes = only_metadata %>% 
+  summarise_all(class)
+important_dates = data.frame(column = colnames(col_classes),
+                             class = as.character(col_classes[1,])) %>% 
+  #remove uninteresting and/or redundant columns
+  dplyr::filter(class == "Date" & !(column %in% c("consent_dt", "admission_datetime", 
+                                                  "First_intub_start", "tracheostomy_dt")))
+timeline_data_covid = only_metadata %>% 
+  dplyr::filter(covid_confirmed == TRUE) %>% 
+  dplyr::select(important_dates$column, binned_outcome, study_id, visit_id) %>% 
+  pivot_longer(cols = first_intubation_date:Third_intub_stop, names_to = "event", values_to = "date") %>% 
+  dplyr::filter(!is.na(date))
+timeline_data_covid$event = gsub("_date|_datetime|First_|first_|Second_|Third_|_start",
+                                 "",
+                                 timeline_data_covid$event)
+timeline_data_covid$event = gsub("^intub$",
+                                 "intubation",
+                                 timeline_data_covid$event)
+timeline_data_covid$event = gsub("^intub_",
+                                 "intubation_",
+                                 timeline_data_covid$event)
+timeline_data_covid$event = gsub("hosp_disch",
+                                 "discharge",
+                                 timeline_data_covid$event)
+timeline_data_covid$event = factor(timeline_data_covid$event)
+
+#add symptom onset -- no longer used
+symptom_onset_covid = symptom_onset %>% 
+  dplyr::filter(case_number %in% timeline_data_covid$study_id & condition_start_date > as.Date("2020-2-1")) %>% 
+  mutate(event = "symptom_onset") %>% 
+  dplyr::select(study_id = case_number, event, date = condition_start_date) %>% 
+  group_by(study_id) %>% 
+  slice(which.min(date)) %>% 
+  ungroup
+# timeline_data_covid = rbind(timeline_data_covid, symptom_onset_covid) 
+
+#absolute dates
+pal = pal_npg("nrc")(9)
+ggplot(timeline_data_covid, aes(x = date, y = study_id)) +
+  geom_point(aes(color = event)) +
+  geom_line()
+
+#remove in-progress patients   
+timeline_data_covid = timeline_data_covid %>% 
+  dplyr::filter(!is.na(binned_outcome))
+
+#relative dates
+first_intubations = timeline_data_covid %>% 
+  group_by(study_id) %>% 
+  dplyr::filter(event == "intubation") %>% 
+  slice(which.min(date)) %>% 
+  select(study_id, first_intubation_date = date)
+timeline_data_covid = timeline_data_covid %>% 
+  left_join(., first_intubations, na_matches = "never") %>% 
+  mutate(relative_day = difftime(date, first_intubation_date, units = "days")) %>% 
+  mutate(event = factor(ifelse(as.character(event) == "discharge",
+                               yes = as.character(binned_outcome),
+                               no = as.character(event)))) %>% 
+  # mutate(event = factor(as.character(ifelse(event == "death",
+  #                                   yes = "Deceased",
+  #                                   no = event)))) %>% 
+  mutate(study_id = fct_reorder(.f = study_id, .x = relative_day, .fun = max, .desc = FALSE)) %>%  #reorder descending
+  dplyr::filter(!is.na(binned_outcome) & binned_outcome != "Other") %>% 
+  unique() 
+timeline_data_covid$event[timeline_data_covid$event == "Deceased"] = "death"
+
+#remove discharge vent stops
+remove = c()
+end_events = c("death", "Discharged",
+               "Inpatient Facility", "Other")
+for(ev in which(timeline_data_covid$event == "intubation_stop"))
+{
+  cur_pt = timeline_data_covid$study_id[ev]
+  event_date = timeline_data_covid$date[ev]
+  cur_sub = subset(timeline_data_covid, study_id == cur_pt & date == event_date)
+  if(any(cur_sub$event %in% end_events))
+  {
+    remove = append(remove, ev)
+  }
+}
+timeline_data_covid = timeline_data_covid[-remove, ]
+#fix duplicate entries
+timeline_data_covid = timeline_data_covid %>% 
+  unique() %>% 
+  dplyr::filter(!(study_id == 1240 & event == "death" & date == as.Date("2020-04-18"))) %>% 
+  dplyr::filter(!(study_id == 1292 & event == "death" & date == as.Date("2020-06-04"))) %>% 
+  dplyr::filter(!(study_id == 1296 & event == "death" & date == as.Date("2020-06-21"))) %>% 
+  dplyr::filter(!(study_id == 1311)) #missing most data
+
+intubation_periods_covid = timeline_data_covid %>% 
+  dplyr::filter(event %in% c("intubation", "intubation_stop", 
+                             "death", "Discharged",
+                             "Inpatient Facility")) 
+#for each intubation start, find nearest end event (extubation or discharge)
+stop = vector(mode = "character", length = nrow(intubation_periods_covid))
+for(pt in unique(intubation_periods_covid$study_id))
+{
+  starts = which(intubation_periods_covid$study_id == pt & 
+                   intubation_periods_covid$event == "intubation")
+  for(intub in starts)
+  {
+    intub_date = intubation_periods_covid$date[intub]
+    stop_subset = subset(intubation_periods_covid, 
+                             study_id == pt &
+                               date >= intub_date &
+                               event != "intubation")
+    first_stop = as.character(min(stop_subset$date))
+    stop[intub] = first_stop
+  }
+}
+intubation_periods_covid$stop = as.Date(stop)
+intubation_periods_covid = intubation_periods_covid %>% 
+  dplyr::filter(event == "intubation") %>% 
+  mutate(relative_day_end = difftime(stop, first_intubation_date, units = "days"))
+  
+#remove unnecessary event types
+timeline_data_covid = timeline_data_covid %>% 
+  dplyr::filter(!grepl("intubation", event)) %>% 
+  mutate(event = factor(as.character(event))) #refactor
+
+final_timeline = ggplot(timeline_data_covid, aes(x = relative_day, y = study_id)) +
+  geom_line(color = "grey60") +
+  geom_segment(data = intubation_periods_covid, 
+            aes(x = relative_day, xend = relative_day_end, y = study_id, yend = study_id),
+            size = 12,
+            color = pal[1],
+            alpha = 0.5,
+            lineend = "round") +
+  geom_point(aes(color = event, shape = event), size = 25) +
+  facet_grid(binned_outcome ~ ., scales = "free_y", space = "free_y") +
+  xlab("Day of Illness") +
+  ylab("") +
+  scale_color_manual(name = "",
+                     values = c("symptom_onset" = pal[9],
+                                "hosp_admission" = pal[6],
+                                "BAL_order" = "grey44",
+                                "Discharged" = pal[3],
+                                "Inpatient Facility" = pal[2],
+                                "Other" = pal[5],
+                                "death" = pal[8]),
+                     labels = c("symptom_onset" = "Symptom Onset",
+                                "hosp_admission" = "Hospital Admission",
+                                "BAL_order" = "BAL",
+                                "Discharged" = "Discharged: home",
+                                "Inpatient Facility" = "Discharged: inpatient facility",
+                                "Other" = "Discharged: other",
+                                "death" = "Death")) +
+  scale_shape_manual(name = "",
+                     values = c("symptom_onset" = 3,
+                                "hosp_admission" = 15,
+                                "BAL_order" = 18,
+                                "Discharged" = 19,
+                                "Inpatient Facility" = 19,
+                                "Other" = 19,
+                                "death" = 13),
+                     labels = c("symptom_onset" = "Symptom Onset",
+                                "hosp_admission" = "Hospital Admission",
+                                "BAL_order" = "BAL",
+                                "Discharged" = "Discharged: home",
+                                "Inpatient Facility" = "Discharged: inpatient facility", 
+                                "Other" = "Discharged: other",
+                                "death" = "Death")) +
+  theme_bw(base_family = "Arial", base_size = 100) +
+  theme(legend.position = "bottom",
+        axis.ticks.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        panel.grid.major.y = element_blank()) +
+  guides(color = guide_legend(nrow=2))
+final_timeline
+```
+
+
+# Summary stats   
+## Patient numbers
+### Metadata   
+```{r}
+complete_patient_data = only_metadata %>% 
+  dplyr::select(study_id, covid_confirmed, pna_type) %>% 
+  unique()
+table(complete_patient_data$covid_confirmed, useNA = "always")
+table(complete_patient_data$pna_type, useNA = "always")
+```   
+   
+### Flow   
+```{r}
+table(data$covid_confirmed, useNA = "always") #samples
+
+#pts
+flow_patients = data %>% 
+  dplyr::select(ID, covid_confirmed) %>% 
+  unique()
+table(flow_patients$covid_confirmed, useNA = "always")
+```   
+   
+### BALs   
+```{r}
+# per patient
+n_bals = only_metadata %>% 
+  count(study_id)
+mean(n_bals$n)
+range(n_bals$n)
+```
+
+
+## Neutrophilic patients   
+### Flow (all days)   
+```{r}
+table(data$covid_confirmed, data$neutrophilic)
+```   
+
+### Flow (D0)   
+```{r}
+flow0 = subset(data, day_of_intubation <= 2 & day_of_intubation >= 0)
+flow0_patients = flow0 %>% 
+  select(pna_type, ID) %>% 
+  unique()
+table(flow0$covid_confirmed, flow0$neutrophilic)
+table(flow0$pna_type)
+table(flow0_patients$pna_type)
+```
+
+## More aesthetic   
+### Aggregate   
+```{r}
+#actually the pal for all boxplots
+fig2_pal = pal_npg("nrc")(9)
+
+fig1_data = only_metadata %>% 
+  dplyr::select(study_id, Ethnicity = ethnicity, Race = races, 
+                Age = age, Sex = gender, `Discharge Status` = binned_outcome,
+                `Smoking Status` = smoking_status, `Pack Years` = pack_years,
+                Diagnosis = pna_type, `Days of Intubation` = day_of_intubation,
+                `Length of ICU Stay` = total_icu_los_days, BMI, covid_confirmed,
+                SOFA = mean_sofa, APS = mean_aps) %>% 
+  mutate_at(c("study_id", "Ethnicity", "Race", "Sex"), factor) %>% 
+  group_by(study_id) %>% 
+  #at least 3 patients had a birthday in the hospital
+  mutate(Age = floor(mean(Age, na.rm = T)), 
+         `Days of Intubation` = max(`Days of Intubation`, na.rm = T),
+         `Length of ICU Stay` = max(`Length of ICU Stay`, na.rm = T)) %>% 
+  ungroup() %>% 
+  unique() %>%
+  dplyr::filter(!duplicated(study_id) & !is.na(study_id) & grepl("\\d{4}", study_id)) %>% 
+  group_by(Diagnosis) %>% 
+  column_to_rownames(var = "study_id") %>% 
+  dplyr::filter(!is.na(`Discharge Status`)) %>%  #remove in-progress 
+  mutate(Outcome = factor(ifelse(`Discharge Status` == "Deceased",
+                                 yes = "Deceased",
+                                 no = "Discharged"))) %>% 
+  dplyr::filter(!is.na(Diagnosis))
+
+#make some manual fixes
+fig1_data$Race[is.na(fig1_data$Race)] = "Unknown or Not Reported"
+fig1_data$Ethnicity[is.na(fig1_data$Ethnicity)] = "Unknown or Not Reported"
+fig1_data$Ethnicity = factor(fig1_data$Ethnicity,
+                             levels = c("Hispanic or Latino", "Not Hispanic or Latino", "Unknown or Not Reported"))
+fig1_data$Sex = as.character(fig1_data$Sex)
+fig1_data$Sex[is.na(fig1_data$Sex)] = "Unknown or Not Reported"
+fig1_data$Sex = factor(fig1_data$Sex)
+fig1_data$`Smoking Status` = as.character(fig1_data$`Smoking Status`)
+fig1_data$`Smoking Status`[is.na(fig1_data$`Smoking Status`)] = "Unknown or Not Reported"
+fig1_data$`Smoking Status` = factor(fig1_data$`Smoking Status`)
+fig1_data$`Pack Years`[fig1_data$`Pack Years` > 150] = NA #need to fix these values
+#not sure how to handle chronic vent pts
+fig1_data$`Days of Intubation`[is.infinite(fig1_data$`Days of Intubation`)] = NA
+fig1_data$`Length of ICU Stay`[is.infinite(fig1_data$`Length of ICU Stay`)] = NA
+fig1_data$Diagnosis = str_wrap(fig1_data$Diagnosis, width = 14)
+fig1_data$Diagnosis = gsub("- ", "-", fig1_data$Diagnosis)
+fig1_data$Diagnosis = factor(fig1_data$Diagnosis,
+                             levels = c("Non-Pneumonia\nControl", "COVID-19",
+                                        "Other Viral\nPneumonia", "Other\nPneumonia"))
+
+print(dfSummary(fig1_data, plain.ascii = FALSE, style = "multiline",
+                varnumbers = F, na.col = F, headings = F,
+                graph.magnif = 0.75, valid.col = FALSE, tmp.img.dir = "/tmp"),
+      method = "viewer")
+```
+   
+### Standard table   
+```{r}
+options(qwraps2_markup = "markdown")
+summary_data = fig1_data %>%
+  dplyr::select(-c(covid_confirmed, `Pack Years`)) %>%
+  mutate(Diagnosis = factor(as.character(gsub("\n", " ", Diagnosis)))) %>%
+  mutate(SOFA = round(SOFA, digits = 2), APS = round(APS, digits = 2)) %>% 
+  group_by(Diagnosis) %>%
+  summary_table(.,
+                summaries = qsummary(., numeric_summaries = list("Minimum" = "~ min(%s)",
+                                         "Median (IQR)" = "~median_iqr(%s)",
+                                         "Mean (sd)" = "~mean_sd(%s)",
+                                         "Maximum" = "~ max(%s)"),
+                                     n_perc_args = list(digits = 1, show_symbol = TRUE, show_denom = "always"),
+                                     ))
+#copied directly into md file below, rendered with knitr
+print(summary_data, file = "~/Box/RGrant/SCRIPT/manuscript_1/200804_table_1.md")
+```
+   
+## List pathogens   
+```{r}
+all_pathogens = data.frame(Pathogen = sort(unique(unlist(total_metadata$organism_name))))
+all_pathogens$Pathogen = gsub(" Note.+$", "", all_pathogens$Pathogen)
+all_pathogens$Pathogen = gsub(" \\([^G].+| #.+| Ceftolozane.+| Beta Lactamase.+| Too.+|Methicillin-Resistant | group.+", 
+                              "", 
+                              all_pathogens$Pathogen)
+all_pathogens = unique(all_pathogens) %>% 
+  remove_rownames()
+
+tex = print.xtable(xtable(all_pathogens), 
+                   print.results = FALSE, 
+                   floating = FALSE)
+setwd("~/Box/RGrant/SCRIPT/")
+writeLines(
+  c(
+     "\\documentclass[12pt]{standalone}",
+    "\\usepackage{caption}",
+    "\\begin{document}",
+    "\\minipage{\\textwidth}",
+    tex,
+     "\\captionof{table}{Pneumonia-causing pathogens detected in the SCRIPT cohort}",
+    "\\endminipage",
+    "\\end{document}"
+  ),
+  con = "~/Box/RGrant/SCRIPT/200728_table_2.tex"
+)
+tools::texi2pdf("200728_table_2.tex", clean = TRUE, )
+write.csv(all_pathogens, "~/Box/RGrant/SCRIPT/200727_pathogens_list.csv")
+```
+
+   
+### Comparisons   
+Race/ethnicity   
+```{r}
+race_plots = ggplot(fig1_data, aes(x = Diagnosis, fill = Race)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  guides(fill=guide_legend(nrow=3,byrow=TRUE)) +
+  scale_fill_manual(name = "",
+                    values = c("American Indian/Alaska Native" = "#3C5488FF",
+                               "Asian" = "#00A087FF",
+                               "Black/African American" = "#E64B35FF",
+                               "Unknown or Not Reported" = "#F39B7FFF",
+                               "White" = "#4DBBD5FF")) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Race") +
+  xlab("")
+race_table = table(fig1_data$Diagnosis, fig1_data$Race)
+white_table = cbind(race_table[, "White", drop = FALSE], (rowSums(race_table) - race_table[, "White", drop = FALSE]))
+colnames(white_table) = c("White", "Other")
+white_comps = pairwise.prop.test(white_table, p.adjust.method = "fdr")
+ethnicity_table = table(fig1_data$Diagnosis, fig1_data$Ethnicity)
+ethnicity_table = ethnicity_table[, 1:2]
+ethnicity_comps = pairwise.prop.test(ethnicity_table, p.adjust.method = "fdr")
+ethnicity_plots = ggplot(fig1_data, aes(x = Diagnosis, fill = Ethnicity)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Ethnicity") +
+  xlab("") +
+  geom_signif(comparisons = list(c("COVID-19", "Non-Pneumonia\nControl"),
+                                 c("Other Viral\nPneumonia", "COVID-19"),
+                                 c("Other\nPneumonia", "COVID-19")), 
+              annotations = c(format(ethnicity_comps$p.value["COVID-19", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(ethnicity_comps$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(ethnicity_comps$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T)),
+              y_position = c(1.05, 1.15, 1.25), 
+              tip_length = 0,
+              aes(y = 1))
+race_ethnicity = race_plots + ethnicity_plots
+race_ethnicity
+```
+
+Age, Sex, BMI   
+```{r}
+fig1_data$Age[fig1_data$Age > 99] = NA #two erroneous entries
+age_comps = pairwise.t.test(x = fig1_data$Age, g = fig1_data$Diagnosis, p.adjust.method = "fdr") #none significant
+age_plot = ggplot(fig1_data, aes(x = Diagnosis, y = Age, fill = Diagnosis)) +
+  geom_boxplot(notch = F, width = 0.5, outlier.shape = NA) + 
+  ylab("Age at Admission (Years)") +
+  geom_jitter(width = 0.25) +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+   theme(legend.position = "none",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Age") +
+  xlab("")
+
+sex_data = table(fig1_data$Diagnosis, fig1_data$Sex)
+sex_comps = pairwise.prop.test(sex_data, p.adjust.method = "fdr") #none significant
+sex_test = prop.test(sex_data)
+sex_plot = ggplot(fig1_data, aes(x = Diagnosis, fill = Sex)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  guides(fill = guide_legend(ncol=2)) +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Sex") +
+  xlab("")
+
+bmi_comps = pairwise.t.test(x = fig1_data$BMI, g = fig1_data$Diagnosis, p.adjust.method = "fdr") 
+bmi_plot = ggplot(fig1_data, aes(x = Diagnosis, y = BMI, fill = Diagnosis)) +
+  geom_boxplot(notch = F, width = 0.5, outlier.shape = NA) + 
+  ylab("Body Mass Index (BMI)") +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Other Viral\nPneumonia"),
+                                 c("COVID-19", "Other\nPneumonia")), 
+              annotations = c(format(bmi_comps$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(bmi_comps$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T)),
+              y_position = c(65, 75), 
+              tip_length = 0,
+              aes(y = 1)) +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("BMI") +
+  xlab("")
+
+age_sex_bmi = sex_plot + age_plot + bmi_plot
+age_sex_bmi
+```
+
+LOS   
+```{r}
+los_comps = pairwise.t.test(x = fig1_data$`Length of ICU Stay`, g = fig1_data$Diagnosis, p.adjust.method = "fdr") #all significant
+los_plot = ggplot(fig1_data, aes(x = Diagnosis, y = `Length of ICU Stay`, fill = Diagnosis)) +
+  geom_boxplot(notch = F, width = 0.5, outlier.shape = NA) + 
+  ylab("Length of ICU Stay (days)") +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Other Viral\nPneumonia"),
+                                 c("COVID-19", "Other\nPneumonia"),
+                                   c("COVID-19", "Non-Pneumonia\nControl"),
+                                 c("Other\nPneumonia", "Non-Pneumonia\nControl")), 
+              annotations = c(format(los_comps$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(los_comps$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(los_comps$p.value["COVID-19", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(los_comps$p.value["Other\nPneumonia", "Non-Pneumonia\nControl"], digits = 2, scientific = T)),
+              y_position = c(70, 90, 100, 110), 
+              tip_length = 0,
+              aes(y = 1)) +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Length of Stay") +
+  xlab("")
+
+vd_comps = pairwise.t.test(x = fig1_data$`Days of Intubation`, g = fig1_data$Diagnosis, p.adjust.method = "fdr") #all significant
+vent_days_plot = ggplot(fig1_data, aes(x = Diagnosis, y = `Days of Intubation`, fill = Diagnosis)) +
+  geom_boxplot(notch = F, width = 0.5, outlier.shape = NA) + 
+  ylab("Days on Ventilator") +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Non-Pneumonia\nControl"),
+                                 c("Other\nPneumonia", "Non-Pneumonia\nControl"),
+                                 c("Other Viral\nPneumonia", "COVID-19"),
+                                 c("Other\nPneumonia", "COVID-19")), 
+              annotations = c(format(vd_comps$p.value["COVID-19", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(vd_comps$p.value["Other\nPneumonia", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(vd_comps$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(vd_comps$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T)), 
+              y_position = c(70, 80, 90, 100), 
+              tip_length = 0,
+              aes(y = 1)) +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Duration of Ventilation") +
+  xlab("")
+
+duration_plots = los_plot + vent_days_plot
+duration_plots
+```
+
+Outcomes   
+```{r}
+discharge_plot =  ggplot(fig1_data, aes(x = Diagnosis, fill = `Discharge Status`)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion")  +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Outcomes") +
+  xlab("")
+
+mortality_sum = table(fig1_data$Diagnosis, fig1_data$Outcome)
+mortality_test = pairwise.prop.test(mortality_sum, p.adjust.method = "fdr") #none significant
+mortality_sum_covid = table(fig1_data$covid_confirmed, fig1_data$Outcome)
+mortality_test_covid = pairwise.prop.test(mortality_sum_covid, p.adjust.method = "fdr")
+
+outcome_plot =  ggplot(fig1_data, aes(x = Diagnosis, fill = Outcome)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Mortality") +
+  xlab("")
+
+outcome_plots = discharge_plot + outcome_plot
+outcome_plots
+```
+
+
+Smoking data   
+```{r}
+fig1_data$active_smoker = factor(fig1_data$`Smoking Status` == "Current Smoker",
+                                 levels = c("TRUE", "FALSE"))
+smoker_sum = table(fig1_data$Diagnosis, fig1_data$active_smoker)
+smoker_test = pairwise.prop.test(smoker_sum, p.adjust.method = "fdr")
+smoker_type_plot =  ggplot(fig1_data, aes(x = Diagnosis, fill = `Smoking Status`)) +
+  geom_bar(position = "fill") +
+  geom_signif(comparisons = list(c("COVID-19", "Other Viral\nPneumonia"),
+                                 c("COVID-19", "Other\nPneumonia"),
+                                   c("COVID-19", "Non-Pneumonia\nControl")), 
+              annotations = c(format(smoker_test$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(smoker_test$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(smoker_test$p.value["COVID-19","Non-Pneumonia\nControl"], digits = 2, scientific = T)),
+              y_position = c(1.05, 1.2, 1.35), 
+              tip_length = 0,
+              aes(y = 1)) +
+  ylab("Proportion") +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom", 
+        text = element_text(family = "Arial"), 
+        plot.title = element_text(hjust = 0.5)) +
+  xlab("") +
+  ggtitle("Smoking Status")
+
+
+pack_year_plot = ggplot(fig1_data, aes(x = Diagnosis, y = `Pack Years`, fill = Diagnosis)) +
+  geom_boxplot(notch = F, width = 0.5, outlier.shape = NA) + 
+  ylab("Pack-Years") +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Other")), 
+              test = "t.test", 
+              tip_length = 0) +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none", text = element_text(family = "Arial")) +
+  xlab("")
+smoker_plot = smoker_type_plot + pack_year_plot
+smoker_plot
+```
+
+All together   
+```{r}
+layout = "AABCD\nAAEFG\nAAHIJ"
+demographics_plot = (final_timeline | ((age_plot | sex_plot | race_plots) /
+                       (ethnicity_plots | smoker_type_plot | bmi_plot) / 
+                       (los_plot | vent_days_plot | outcome_plot))) + 
+  plot_layout(widths = c(2, 4)) +
+  plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 120))
+
+CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200715_demographics_v4.pdf",
+    width = 150,
+    height = 100, family = "Arial")
+demographics_plot
+dev.off()
+
+demographics_plot
+```
+
+
+## Sample info   
+### Number of serial samples   
+```{r}
+length(serial_patients)
+```   
+ 
+### Distribution of days   
+All   
+```{r}
+ggplot(only_metadata, aes(x = day_of_intubation)) +
+  geom_histogram(fill = "dodgerblue4", binwidth = 1)
+```
+
+Only flow:   
+```{r}
+ggplot(only_metadata, aes(x = day_of_intubation)) +
+  geom_histogram(fill = "dodgerblue4", binwidth = 1) +
+  ylab("Count") +
+  xlab("Day of Ventilation")
+```   
+
+### Samples per patient   
+Only flow   
+```{r}
+patient_counts = as.data.frame(table(data$ID))
+patient_counts_non_covid = as.data.frame(table(subset(data, covid_confirmed == FALSE)$ID))
+patient_counts_covid = as.data.frame(table(subset(data, covid_confirmed == TRUE)$ID))
+non_covid_samples = ggplot(patient_counts_non_covid, aes(x = Freq)) +
+  geom_histogram(fill = "dodgerblue4", binwidth = 1) +
+  ylab("Count") +
+  xlab("") +
+  scale_x_continuous(n.breaks = 10) +
+  ggtitle("COVID-") +
+  xlim(0,6)
+covid_samples = ggplot(patient_counts_covid, aes(x = Freq)) +
+  geom_histogram(fill = "firebrick", binwidth = 1) +
+  ylab("Count") +
+  xlab("Samples per Patient") +
+  scale_x_continuous(n.breaks = 10) +
+  ggtitle("COVID+") +
+  xlim(0,6)
+
+non_covid_samples / covid_samples
+```
+
+
+
+### Patient timelines   
+
+
+## Distributions   
+### Percentages   
+```{r}
+percentage_data = subset(data_long, grepl("percent", data_long$flow_parameter))
+shapiro.test(percentage_data$value)
+hist(percentage_data$value, breaks = 50)
+```   
+
+Extremely non-normal in both cases. At the very least, we need nonparametric tests. In reality, we probably need non-parametric tests or beta regression. However, this may not be true of individual parameters. First let's see if transformations help.   
+
+## Progressions   
+### Granular   
+```{r}
+serial_data = subset(percentage_data, patient_id %in% serial_patients & 
+                       flow_parameter %in% c("percent_CD4_total", "percent_CD8_total",
+                                             "percent_macs_CD206_high", "percent_macs_CD206_low",
+                                             "percent_monocytes", "percent_neutrophils",
+                                             "percent_others") &
+                       !is.na(day_of_intubation)) %>% 
+  unique() %>% 
+  arrange(binned_outcome, ID)
+observations = table(serial_data$patient_id) / length(unique(serial_data$flow_parameter))
+usable_serial_patients = names(observations[observations > 1])
+serial_data = subset(serial_data,  patient_id %in% usable_serial_patients & covid_confirmed == TRUE)
+
+ggplot(serial_data, aes(x = day_of_intubation, y = value, fill = flow_parameter)) +
+  geom_bar(position = "stack", stat = "identity", width = 1) +
+  facet_grid(binned_outcome + ID  ~ ., 
+             drop = T, 
+             labeller = labeller(binned_outcome = label_value, ID = label_value)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_npg(name = "Flow Parameter",
+                     labels = c("percent_CD4_total" = "% CD4 T",
+                                "percent_CD8_total" = "% CD8 T",
+                                "percent_macs_CD206_high" = "% CD206-high Macrophages",
+                                "percent_macs_CD206_low" = "% CD206-low Macrophages",
+                                "percent_monocytes" = "% Monocytes",
+                                "percent_neutrophils" = "% Neutrophils",
+                                "percent_others" = "% Others")) +
+  ylab("Percent of Total Cells") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(text = element_text(family = "Arial"),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank()) +
+  xlab("Day of Intubation")
+  
+coinfection_data = serial_data %>% 
+  dplyr::filter(any_nonviral == TRUE) %>% 
+  dplyr::select(day_of_intubation, ID, binned_outcome)
+serial_plot_coinfection = ggplot(serial_data, aes(x = day_of_intubation, y = value, fill = flow_parameter)) +
+  geom_tile(data = coinfection_data, 
+            aes(x = day_of_intubation, y = 50), 
+            width = 1.8, height = 100, 
+            fill = "firebrick4",
+            alpha = 0.1) +
+  geom_bar(position = "stack", stat = "identity", width = 0.9, size = 1) +
+  facet_grid(binned_outcome + ID  ~ ., 
+             drop = T,
+             labeller = labeller(binned_outcome = label_value, ID = label_value)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_npg(name = "Flow Parameter",
+                     labels = c("percent_CD4_total" = "% CD4 T",
+                                "percent_CD8_total" = "% CD8 T",
+                                "percent_macs_CD206_high" = "% CD206-high Macrophages",
+                                "percent_macs_CD206_low" = "% CD206-low Macrophages",
+                                "percent_monocytes" = "% Monocytes",
+                                "percent_neutrophils" = "% Neutrophils",
+                                "percent_others" = "% Others")) +
+  ylab("Percent of Total Cells") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(text = element_text(family = "Arial"),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank()) +
+  xlab("Day of Intubation") +
+  scale_color_manual(name = "",
+                       values = c("FALSE" = alpha("white", 0),
+                                  "TRUE" = "black"),
+                       labels = c("FALSE" = "Primary Only",
+                                  "TRUE" = "Superinfection"))
+serial_plot_coinfection
+```   
+   
+### Simplified   
+```{r}
+serial_data_simplified = serial_data %>% 
+  pivot_wider(names_from = flow_parameter, values_from = value) %>% 
+  mutate(percent_macs = percent_macs_CD206_high + percent_macs_CD206_low,
+         percent_T_cells = percent_CD4_total + percent_CD8_total) %>% 
+  dplyr::select(-c(percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low)) %>% 
+  pivot_longer(percent_neutrophils:percent_T_cells, names_to = "flow_parameter", values_to = "value") %>% 
+  group_by(ID, day_of_intubation) %>% 
+  mutate(dominant_cell = factor(gsub("percent_", "", flow_parameter[which.max(value)]))) %>% 
+  dplyr::filter(!is.na(binned_outcome) & binned_outcome != "Other") %>% 
+  mutate(coinfection = factor(ifelse(any_nonviral == TRUE,
+                                     yes = "Superinfection",
+                                     no = "Primary Only")))
+
+covid_serial_simp = subset(serial_data_simplified, covid_confirmed == T)
+table(covid_serial_simp$coinfection, covid_serial_simp$dominant_cell)
+table(covid_serial_simp$coinfection, covid_serial_simp$neutrophilic)
+
+simplified_progression_plot = ggplot(serial_data_simplified, aes(x = day_of_intubation, y = ID)) +
+  geom_line(color = "gray50") +
+  facet_grid(binned_outcome ~ ., scales = "free_y", space = "free_y") +
+  geom_point(aes(color = dominant_cell, shape = coinfection), size = 6) +
+  scale_shape_manual(name = "",
+                       guide = guide_legend(ncol = 1, byrow = T),
+                       values = c("Primary Only" = 16,
+                                  "Superinfection" = 10)) +
+  scale_color_npg(name = "",
+                       labels = c("T_cells" = "T Lymphocytes",
+                                  "neutrophils" = "Neutrophils",
+                                  "monocytes" = "Monocytes",
+                                  "macs" = "Macrophages",
+                                  "others" = "Other"),
+                  guide = guide_legend(ncol = 2, byrow = T)) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        text = element_text(family = "Arial"),
+        legend.text = element_text(family = "Arial"),
+        legend.title = element_text(family = "Arial"),
+        legend.position = "bottom") +
+  xlab("Day of Intubation") +
+  ylab("")
+simplified_progression_plot
+```
+
+
+As expected, there appear to be neutrophilic and non-neutrophilic trajectories captured here.   
+   
+## What are the kinetics of MoAM recruitment and maturation?   
+### TRAM levels over time   
+```{r}
+covid_flow = subset(data, covid_confirmed == TRUE)
+ggplot(data, aes(x = day_of_intubation, y = percent_macs_CD206_high, color = pna_type)) +
+  facet_wrap(~pna_type, scale = "free_y") +
+  geom_point() +
+  geom_smooth(se = T)
+```   
+Might be an uptick at later timepoints as would be expected, but this is very unclear.   
+   
+### MoAM levels over time   
+```{r}
+covid_flow = subset(data, covid_confirmed == TRUE)
+ggplot(data, aes(x = day_of_intubation, y = percent_macs_CD206_low, color = pna_type)) +
+  facet_wrap(~pna_type, scale = "free_y") +
+  geom_point() +
+  geom_smooth(se = T)
+```
+   
+### Plot contributions (just day 0 for now)   
+```{r}
+day0_percentages = subset(percentage_data, day_of_intubation <= 2 & day_of_intubation >= 0 &
+                            !(flow_parameter %in% c("percent_CD4_total", "percent_CD206_total", "percent_total_CD206_low", "percent_total_CD206_high", "percent_macrophages", "percent_CD3_total")))
+ggplot(day0_percentages, aes(x = Sample, y = value, fill = flow_parameter)) +
+  geom_bar(position = "stack", stat = "identity") +
+  facet_grid(. ~ covid_confirmed, scales = "free_x") +
+  theme(axis.text.x = element_blank())
+```
+
+# Analysis   
+## Associations with neutrophilia   
+### Predictive value for COVID-19   
+```{r}
+initial_coinfection = data %>% 
+  dplyr::filter(covid_confirmed == T & day_of_intubation >= 0 & day_of_intubation <= 2 & any_nonviral == T) %>% 
+  dplyr::select(ID) %>% 
+  unique()
+initial_coinfection = as.character(initial_coinfection$ID)
+covid_prediction_neutrophilia = data %>% 
+  dplyr::filter(covid_confirmed == T & !(ID %in% initial_coinfection)) %>% 
+  dplyr::select(Sample, ID, any_nonviral, neutrophilic) %>% 
+  mutate(prediction = factor(ifelse(neutrophilic == "Neutrophilic", yes = "TRUE", no = "FALSE"))) %>% 
+  mutate(any_nonviral = factor(any_nonviral))
+ppv(data = covid_prediction_neutrophilia, truth = any_nonviral, estimate = prediction)
+npv(data = covid_prediction_neutrophilia, truth = any_nonviral, estimate = prediction)
+```
+
+### Superinfection   
+All days      
+```{r}
+covid_data = subset(data, covid_confirmed == TRUE)
+shapiro.test(covid_data$percent_neutrophils) 
+hist(covid_data$percent_neutrophils, n = 20) #not at all normal
+wilcox.test(percent_neutrophils ~ infection_detected, data = covid_data) #marginal significance
+
+ggplot(covid_data, aes(x = infection_detected, y = percent_neutrophils, fill = infection_detected)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) + 
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("TRUE", "FALSE")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none") +
+  ylab("Percent Neutrophils") +
+  xlab("Superinfection")
+
+#discretized   
+neutro_sum = table(covid_data$infection_detected,covid_data$neutrophilic)
+prop.test(neutro_sum)
+ggplot(covid_data, aes(x = infection_detected, fill = neutrophilic)) +
+  geom_bar(position = "fill") + 
+  geom_signif(comparisons = list(c("TRUE", "FALSE")),
+              annotations = formatC(prop.test(neutro_sum)$p.value, digits = 2),
+              y_position = 1.05, 
+              tip_length = 0,
+              aes(y = 1)) +
+  ylab("Proportion Neutrophilic") +
+  xlab("Superinfection")
+```   
+Significant now!    
+
+Day 0   
+```{r}
+#continuous
+covid_data_day0 = subset(covid_data, day_of_intubation <= 2 & day_of_intubation >= 0)
+shapiro.test(covid_data_day0$percent_neutrophils) 
+wilcox.test(percent_neutrophils ~ infection_detected, data = covid_data_day0) #marginal significance
+
+ggplot(covid_data_day0, aes(x = infection_detected, y = percent_neutrophils, fill = infection_detected)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) + 
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("TRUE", "FALSE")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none") +
+  ylab("Percent Neutrophils") +
+  xlab("Superinfection")
+
+#discretized   
+neutro_sum_day0 = table(covid_data_day0$infection_detected,covid_data_day0$neutrophilic)
+prop.test(neutro_sum_day0)
+```   
+Nowhere near enough power, here.   
+
+### Inflammatory biomarkers   
+All samples (COVID)   
+```{r}
+shapiro.test(covid_data$C_Reactive_Protein)
+hist(covid_data$C_Reactive_Protein, n = 50) #not very normal
+ggplot(covid_data, aes(neutrophilic, y = C_Reactive_Protein, fill = neutrophilic)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("Neutrophilic", "Non-Neutrophilic")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none")
+ggplot(covid_data, aes(neutrophilic, y = FERRITIN, fill = neutrophilic)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("Neutrophilic", "Non-Neutrophilic")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none")
+
+ggplot(covid_data, aes(neutrophilic, y = D_DIMER, fill = neutrophilic)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("Neutrophilic", "Non-Neutrophilic")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none")
+```
+
+
+Day 0 (COVID)  
+```{r}
+shapiro.test(covid_data_day0$C_Reactive_Protein)
+hist(covid_data_day0$C_Reactive_Protein, n = 50) #not very normal
+ggplot(covid_data_day0, aes(neutrophilic, y = C_Reactive_Protein, fill = neutrophilic)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("Neutrophilic", "Non-Neutrophilic")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none")
+ggplot(covid_data_day0, aes(neutrophilic, y = FERRITIN, fill = neutrophilic)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("Neutrophilic", "Non-Neutrophilic")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none")
+ggplot(covid_data_day0, aes(neutrophilic, y = D_DIMER, fill = neutrophilic)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  geom_signif(comparisons = list(c("Neutrophilic", "Non-Neutrophilic")), 
+              test = "wilcox.test", 
+              tip_length = 0) +
+  theme(legend.position = "none")
+```
+
+## MANCOVA (all percentages)
+```{r eval=FALSE}
+data_wide_percentage = percentage_data %>% 
+  pivot_wider(names_from = flow_parameter, 
+              values_from = c(logit, value))
+data_wide_percentage$covid_confirmed[is.na(data_wide_percentage$covid_confirmed)] = FALSE
+data_wide_percentage$covid_confirmed = factor(data_wide_percentage$covid_confirmed)
+data_wide_percentage$response = data_wide_percentage %>% 
+  select(logit_percent_CD4_total:logit_percent_others)
+mancova_data = data_wide_percentage %>% 
+  select(c(logit_percent_CD4_total:logit_percent_others, 
+           covid_confirmed, day_of_intubation, binned_outcome)) %>% 
+  na.omit()
+mancova_fit = manova(cbind(logit_percent_CD4_total, logit_percent_CD4_Tregs, logit_percent_CD4_non_Tregs,
+                           logit_percent_CD8_total, logit_percent_CD206_total, 	logit_percent_macs_CD206_high,
+                           logit_percent_total_CD206_high, 	logit_percent_macs_CD206_low, logit_percent_total_CD206_low,
+                           logit_percent_neutrophils, logit_percent_monocytes, logit_percent_others) 
+                     ~ covid_confirmed * binned_outcome * day_of_intubation,
+                     na.action = "na.omit",
+                     data = mancova_data) #add outcomes??
+summary.aov(mancova_fit)
+```   
+
+These are interesting results! With the exception of monocytes, abundance of all cells is affected by COVID-19 in some way. For CD4T, and CD8T, this appears to be purely a main effect. For Tregs and putative MoAM, there is also an interaction effect of day and infection. For TRAM, there is only an interaction effect.   
+
+## Visualize   
+Area plot   
+```{r}
+area_data = percentage_data %>% 
+  group_by(covid_confirmed, day_of_intubation, flow_parameter) %>% 
+  dplyr::summarize(mean_pct = mean(value))
+area_data = subset(area_data, !(flow_parameter %in% c("percent_CD4_total", "percent_CD206_total", "percent_total_CD206_low", "percent_total_CD206_high")))
+# ggplot(area_data, aes(x = day_of_intubation, y = mean_pct, fill = flow_parameter)) +
+#   geom_area(alpha = 0.7) +
+#   facet_grid(covid_confirmed ~ .)
+```
+This give a false impression between samples. A line plot may actually be better.   
+
+### Line plot   
+Grouped   
+```{r eval=FALSE}
+ggplot(percentage_data, aes(x = day_of_intubation, y = value, color = flow_parameter)) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.5, alpha = 0.5) +
+  facet_grid(binned_outcome ~ covid_confirmed)
+```
+
+By patient   
+```{r eval=FALSE}
+ggplot(percentage_data, aes(x = day_of_intubation, y = value, color = flow_parameter)) +
+  geom_line() +
+  facet_wrap(~ ID)
+```
+Not enough data at this point to glean much of anything.   
+
+## Heatmaps of flow parameters   
+### D0     
+All parameters (for internal use)   
+```{r}
+#cast into matrix of patient x flow parameter
+all_day0 = data %>% 
+  dplyr::filter(as.numeric(ID) >= 1211) %>%  #select only new panel
+  dplyr::filter(day_of_intubation <= 2 & day_of_intubation >= 0) %>% 
+  dplyr::filter(!duplicated(ID)) %>% #keep only earliest sample
+  select(ID, percent_CD4_total:percent_monocytes, binned_outcome, covid_confirmed)
+annotation_data = all_day0 %>% 
+  select(ID, binned_outcome, covid_confirmed) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID")
+
+matrix_data = all_day0 %>% 
+  select(ID, percent_CD4_total:percent_monocytes) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID") %>% 
+  as.matrix() %>% 
+  t()
+
+pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         show_colnames = F,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         angle_col = 45,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101))
+```   
+ 
+Limited (for manuscript)   
+```{r}
+#cast into matrix of patient x flow parameter
+all_day0 = data %>% 
+  dplyr::filter(day_of_intubation <= 2 & day_of_intubation >= 0) %>% 
+  dplyr::filter(!duplicated(ID)) %>% #keep only earliest sample
+  select(ID, percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low, 
+         percent_monocytes, percent_neutrophils, Diagnosis = pna_type)
+
+annotation_data = all_day0 %>% 
+  select(ID, Diagnosis) %>% 
+  remove_rownames() %>% 
+  mutate(Diagnosis = factor(as.character(Diagnosis))) %>% 
+  column_to_rownames(var = "ID") 
+
+matrix_data = all_day0 %>% 
+  select(ID, percent_CD4_total:percent_neutrophils) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID") %>% 
+  as.matrix() %>% 
+  t()
+
+rownames(matrix_data) = c("% CD4 T", "% CD8 T", "% CD206-high AM", "% CD206-low AM",
+                          "% Monocytes", "% Neutrophils")
+
+pal = pal_npg("nrc")(9)
+fig2_heatmap = pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         show_colnames = F,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         angle_col = 45,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+         annotation_names_col = F,
+         annotation_colors = list(Diagnosis = c("Healthy Control" = fig2_pal[6],
+                                                "Non-Pneumonia Control" = pal[2],
+                                                "COVID-19" = pal[1],
+                                                "Other Viral Pneumonia" = pal[3],
+                                                "Other Pneumonia" = pal[4])),
+         fontsize_row = 65,
+         fontsize = 65)
+fig2_heatmap_nolegend = pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         show_colnames = F,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         angle_col = 45,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+         annotation_names_col = F,
+         annotation_colors = list(Diagnosis = c("Healthy Control" = fig2_pal[6],
+                                                "Non-Pneumonia Control" = pal[2],
+                                                "COVID-19" = pal[1],
+                                                "Other Viral Pneumonia" = pal[3],
+                                                "Other Pneumonia" = pal[4])),
+         fontsize_row = 65,
+         legend = F,
+         annotation_legend = F,
+         fontsize = 65)
+```   
+ 
+### D0, COVID only
+```{r}
+#cast into matrix of patient x flow parameter
+all_day0 = data %>% 
+  dplyr::filter(day_of_intubation <= 2 & day_of_intubation >= 0 & covid_confirmed == TRUE) %>% 
+  dplyr::filter(!duplicated(ID)) %>% #keep only earliest sample
+  select(ID, percent_CD4_total:percent_monocytes, binned_outcome)
+annotation_data = all_day0 %>% 
+  select(ID, binned_outcome) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID")
+
+matrix_data = all_day0 %>% 
+  select(ID, percent_CD4_total:percent_monocytes) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "ID") %>% 
+  as.matrix()
+
+pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_row = annotation_data,
+         scale = "column",
+         angle_col = 45,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101))
+```   
+
+### All days   
+```{r}
+all_days = data %>% 
+  dplyr::filter(!is.na(day_of_intubation) & !is.na(pna_type)) %>% 
+  select(Sample, percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low, 
+         percent_monocytes, percent_neutrophils, Diagnosis = pna_type, finite_day_of_intubation,
+         any_nonviral) %>% 
+  arrange(Diagnosis, finite_day_of_intubation) %>% 
+  unique()
+annotation_data = all_days %>% 
+  select(Sample, Diagnosis, finite_day_of_intubation, any_nonviral) %>% 
+  mutate(Diagnosis = factor(Diagnosis), 
+         Superinfection = factor(ifelse(any_nonviral == TRUE,
+                                        yes = "Superinfection",
+                                        no = "Primary Only"))) %>% 
+  dplyr::select(-any_nonviral) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "Sample")
+
+matrix_data = all_days %>% 
+  select(Sample, percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low, 
+         percent_neutrophils, percent_monocytes) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "Sample") %>% 
+  as.matrix() %>% 
+  t()
+
+rownames(matrix_data) = c("% CD4T", "% CD8 T", "% CD206-high Macrophages", "% CD206-low Macrophages",
+                          "% Neutrophils", "% Monocytes")
+
+intubation_pal = colorRampPalette(brewer.pal(n = 9, name = "Purples")[3:9])(max(data$finite_day_of_intubation, na.rm = T) + 1)
+intubation_pal[1:3] = rep("#000000",3) #highlight "D0"
+
+all_clustered = pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         show_colnames = F,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+         annotation_colors = list(Diagnosis = c("Non-Pneumonia Control" = pal[2],
+                                                "COVID-19" = pal[1],
+                                                "Other Viral Pneumonia" = pal[3],
+                                                "Other Pneumonia" = pal[4]),
+                                  finite_day_of_intubation = intubation_pal,
+                                  Superinfection = c("Superinfection" = pal[8],
+                                                     "Primary Only" = pal[7])),
+         fontsize_row = 65,
+         fontsize = 65)
+all_clustered_nolegend = pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         show_colnames = F,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+         annotation_colors = list(Diagnosis = c("Non-Pneumonia Control" = pal[2],
+                                                "COVID-19" = pal[1],
+                                                "Other Viral Pneumonia" = pal[3],
+                                                "Other Pneumonia" = pal[4]),
+                                  finite_day_of_intubation = intubation_pal,
+                                  Superinfection = c("Superinfection" = pal[8],
+                                                     "Primary Only" = pal[7])),
+         fontsize_row = 65,
+         fontsize = 65,
+         legend = F,
+         annotation_legend = F)
+
+all_unclustered = pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         cluster_cols = F,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         show_colnames = F,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+         annotation_colors = list(Diagnosis = c("Non-Pneumonia Control" = pal[2],
+                                                "COVID-19" = pal[1],
+                                                "Other Viral Pneumonia" = pal[3],
+                                                "Other Pneumonia" = pal[4]),
+                                  finite_day_of_intubation = intubation_pal,
+                                  Superinfection = c("Superinfection" = pal[8],
+                                                     "Primary Only" = pal[7])),
+         fontsize_row = 65,
+         fontsize = 65)
+all_unclustered_nolegend = pheatmap(mat = matrix_data, 
+         cluster_rows = T,
+         cluster_cols = F,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         show_colnames = F,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+         annotation_colors = list(Diagnosis = c("Non-Pneumonia Control" = pal[2],
+                                                "COVID-19" = pal[1],
+                                                "Other Viral Pneumonia" = pal[3],
+                                                "Other Pneumonia" = pal[4]),
+                                  finite_day_of_intubation = intubation_pal,
+                                  Superinfection = c("Superinfection" = pal[8],
+                                                     "Primary Only" = pal[7])),
+         fontsize_row = 65,
+         fontsize = 65,
+         legend = F,
+         annotation_legend = F)
+```
+
+### Only serial   
+```{r}
+all_days_serial = data %>% 
+  dplyr::filter(!is.na(day_of_intubation) & ID %in% usable_serial_patients & pna_type == "COVID-19") %>% 
+  select(ID, percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low, 
+         percent_neutrophils, binned_outcome, day_of_intubation, Sample) %>% 
+  arrange(ID, day_of_intubation)
+
+annotation_data = all_days_serial %>% 
+  select(Sample, binned_outcome, day_of_intubation) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "Sample")
+
+matrix_data = all_days_serial %>% 
+  select(Sample, percent_CD4_total:percent_neutrophils) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "Sample") %>% 
+  as.matrix() %>% 
+  t()
+rownames(matrix_data) = c("% CD4 T", "% CD8 T", "% CD206-high AM", "% CD206-low AM",
+                          "% Neutrophils")
+
+breaks = which(!duplicated(all_days_serial$ID)) - 1
+pheatmap(mat = matrix_data, 
+         cluster_rows = F,
+         cluster_cols = F,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         show_colnames = F,
+         cellheight = 50,
+         cellwidth = 8,
+         gaps_col = breaks,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101))
+```   
+   
+## Render figure 2   
+### Cell type percentages   
+```{r}
+
+fig2_data = data_long %>%
+  dplyr::filter(!is.na(pna_type)) %>% 
+  mutate(Superinfection = factor(ifelse(any_nonviral == TRUE,
+                                        yes = "Superinfection",
+                                        no = "Primary Only"),
+                                 levels = c("Primary Only", "Co-Infection Detected"))) %>% 
+  dplyr::filter(flow_parameter %in% c("percent_CD4_total", "percent_CD8_total", "percent_neutrophils", 
+                                      "percent_macs_CD206_high", "percent_macs_CD206_low", 
+                                      "percent_monocytes"))
+celltype_names = data.frame(flow_parameter = unique(fig2_data$flow_parameter),
+                            cell_type = factor(c("Percent CD4 T", "Percent CD8 T", "Percent Neutrophils",
+                                                 "Percent CD206hi Macrophages", "Percent CD206lo Macrophages",
+                                                 "Percent Monocytes"),
+                                               levels = c("Percent Neutrophils", sort(c("Percent CD4 T", 
+                                                                                      "Percent CD8 T",
+                                                                                      "Percent CD206hi Macrophages",
+                                                                                      "Percent CD206lo Macrophages",
+                                                                                      "Percent Monocytes")))))
+fig2_data = left_join(fig2_data, celltype_names) 
+                                          
+  
+fig2_data$Diagnosis = str_wrap(fig2_data$pna_type, width = 14)
+fig2_data$Diagnosis = gsub("- ", "-", fig2_data$Diagnosis)
+fig2_data$Diagnosis = factor(fig2_data$Diagnosis,
+                             levels = c("Non-Pneumonia\nControl","COVID-19", 
+                                        "Other Viral\nPneumonia","Other\nPneumonia"))
+fig2_data = fig2_data %>% 
+  mutate(combined_factor = factor(paste(Diagnosis, Superinfection, sep = "_")))
+
+fig2_data_0 = dplyr::filter(fig2_data, day_of_intubation >= 0 & day_of_intubation <= 2)
+```   
+   
+Evertything at once :')   
+```{r}
+all_comps = lapply(unique(fig2_data$cell_type), function(x){
+  sub = subset(fig2_data, cell_type == x)
+  #we will adjust all p-vals together later
+  tests = pairwise.wilcox.test(x = sub$value, g = sub$combined_factor, p.adjust.method = "none")$p.value %>%
+    as.data.frame() %>% 
+    rownames_to_column("comp1") %>% 
+    pivot_longer(cols = 2:ncol(.), names_to = "comp2", values_to = "pval") %>% 
+    dplyr::filter(!is.na(pval)) %>% 
+    mutate(cell_type = x)
+  return(tests) })
+all_comps = bind_rows(all_comps) %>% 
+  separate(comp1, c("diagnosis1", "super1"), sep = "_") %>% 
+  separate(comp2, c("diagnosis2", "super2"), sep = "_") %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  dplyr::filter((diagnosis1 == diagnosis2 & super1 != super2) |
+                  (super1 == super2 & diagnosis1 != diagnosis2))
+
+start_table = data.frame(diagnosis1 = rep(levels(fig2_data$Diagnosis), 2),
+                         super1 = c(rep("Primary Only", 4), rep("Co-Infection Detected", 4)),
+                         start = c(c(1:4) - 0.2, c(1:4) + 0.2))
+end_table = data.frame(diagnosis2 = rep(levels(fig2_data$Diagnosis), 2),
+                         super2 = c(rep("Primary Only", 4), rep("Co-Infection Detected", 4)),
+                         end = c(c(1:4) - 0.2, c(1:4) + 0.2))
+all_comps = left_join(all_comps, start_table) %>% 
+  left_join(., end_table) %>% 
+  mutate(annot = ifelse(padj < 0.01,
+                        no = "*",
+                        yes = ifelse(padj < 0.001,
+                                     no = "**",
+                                     yes = "***"))) %>% 
+  mutate(numeric_annot = format(padj, digits = 2, scientific = T)) %>% 
+  mutate(arbitrary_group = rownames(.)) %>% 
+  mutate(y = c(50, 55, 30, 60, 65,
+               40, 45, 27.5, 110, 105,
+               100, 65, 60, 32.5, 22)) #had to just do this manually
+                         
+
+
+
+combined_plot = ggplot(fig2_data, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, aes(alpha = Superinfection)) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  scale_alpha_manual(name = "",
+                     values = c("Primary Only" = 1,
+                                "Co-Infection Detected" = 0.7)) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5), 
+        strip.background = element_blank(),
+        strip.text = element_text(size = 90)) +
+  geom_jitter(width = 0.25) +
+  guides(alpha=guide_legend(override.aes=list(fill=hcl(c(15,195),100,0,alpha=c(1,0.7)),
+                                              colour=NA),
+                            nrow = 2)) +
+  geom_signif(inherit.aes = F, 
+              family = "Arial",
+              data = all_comps,
+              textsize = 12,
+              aes(Group = cell_type, xmin = start, xmax = end, 
+                  annotations = numeric_annot, y_position = y,
+                  group = arbitrary_group),
+              tip_length = 0,
+              manual=TRUE) +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 3)
+
+
+
+combined_plot
+```
+   
+Evertything at once, D0   
+Note: can't split by co-infection due to low N   
+```{r}
+all_comps = lapply(unique(fig2_data_0$cell_type), function(x){
+  sub = subset(fig2_data_0, cell_type == x)
+  #we will adjust all p-vals together later
+  tests = pairwise.wilcox.test(x = sub$value, g = sub$Diagnosis, p.adjust.method = "none")$p.value %>%
+    as.data.frame() %>% 
+    rownames_to_column("comp1") %>% 
+    pivot_longer(cols = 2:ncol(.), names_to = "comp2", values_to = "pval") %>% 
+    dplyr::filter(!is.na(pval)) %>% 
+    mutate(cell_type = x)
+  return(tests) })
+all_comps = bind_rows(all_comps) %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05)
+
+all_comps = all_comps %>% 
+  mutate(annot = ifelse(padj < 0.01,
+                        no = "*",
+                        yes = ifelse(padj < 0.001,
+                                     no = "**",
+                                     yes = "***"))) %>%
+  mutate(numeric_annot = format(padj, digits = 2, scientific = T)) %>%
+  mutate(arbitrary_group = rownames(.)) %>%
+  mutate(y = c(50, 60, 45, 55, 105,
+               85, 95, 50, 60, 45)) #had to just do this manually
+                         
+
+
+
+combined_plot_D0 = ggplot(fig2_data_0, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5), 
+        strip.background = element_blank(),
+        strip.text = element_text(size = 90)) +
+  geom_jitter(width = 0.25) +
+  guides(alpha=guide_legend(override.aes=list(fill=hcl(c(15,195),100,0,alpha=c(0.2,0.7)),
+                                              colour=NA))) +
+  geom_signif(inherit.aes = F,
+              family = "Arial",
+              data = all_comps,
+              textsize = 12,
+              aes(Group = cell_type, xmin = comp1, xmax = comp2,
+                  annotations = numeric_annot, y_position = y,
+                  group = arbitrary_group),
+              tip_length = 0,
+              manual=TRUE) +
+  facet_wrap(~cell_type, scales = "free_y", ncol = 3)
+
+combined_plot_D0
+```
+   
+Neutrophils   
+```{r}
+fig2_netrophils = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_neutrophils"))
+neutro_mean = mean(fig2_netrophils$value, na.rm = T) #53.7%
+
+neutro_comp = pairwise.wilcox.test(x = fig2_netrophils$value, 
+                                   g = fig2_netrophils$Diagnosis,
+                                   p.adjust.method = "fdr")
+neutrophil_plot = ggplot(fig2_netrophils, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, aes(alpha = Superinfection)) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  scale_alpha_manual(values = c("Co-Infection Detected" = 0.7,
+                                "Primary Only" = 1)) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(#legend.position = "none", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Other\nPneumonia")), 
+              annotations = c(format(neutro_comp$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T)),
+              y_position = c(105), 
+              tip_length = 0,
+              aes(y = 1)) +
+  ggtitle("Neutrophils")
+table(fig2_netrophils$Diagnosis, fig2_netrophils$neutrophilic)
+
+neutrophil_plot
+```   
+   
+CD4 T-cells   
+```{r}
+fig2_cd4 = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_CD4_total"))
+cd4_mean = mean(fig2_cd4$value, na.rm = T) #4.78%
+
+cd4_comp = pairwise.wilcox.test(x = fig2_cd4$value, 
+                                   g = fig2_cd4$Diagnosis,
+                                   p.adjust.method = "fdr")
+
+cd4t_plot = ggplot(fig2_cd4, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Other\nPneumonia"),
+                                 c("COVID-19", "Other Viral\nPneumonia"),
+                                 c("COVID-19", "Non-Pneumonia\nControl")), 
+              annotations = c(format(cd4_comp$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(cd4_comp$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(cd4_comp$p.value["COVID-19", "Non-Pneumonia\nControl"], digits = 2, scientific = T)),
+              y_position = c(40, 45, 35), 
+              tip_length = 0,
+              aes(y = 1)) +
+  ggtitle("CD4+ T-Cells")
+
+cd4t_plot
+```
+   
+CD8 T-cells   
+```{r}
+fig2_cd8 = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_CD8_total"))
+cd8_mean = mean(fig2_cd8$value, na.rm = T) #5.69%
+
+cd8_comp = pairwise.wilcox.test(x = fig2_cd8$value, 
+                                   g = fig2_cd8$Diagnosis,
+                                   p.adjust.method = "fdr")
+cd8t_plot = ggplot(fig2_cd8, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  geom_signif(comparisons = list(c("COVID-19", "Other\nPneumonia"),
+                                 c("COVID-19", "Other Viral\nPneumonia")), 
+              annotations = c(format(cd8_comp$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T),
+                              format(cd8_comp$p.value["Other Viral\nPneumonia", "COVID-19"], digits = 2, scientific = T)),
+              y_position = c(55, 50, 60), 
+              tip_length = 0,
+              aes(y = 1)) +
+  ggtitle("CD8+ T-Cells")
+
+cd8t_plot
+```   
+   
+General t cells   
+```{r}
+fig2_tcells = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_CD8_total", "percent_CD4_total")) %>% 
+  pivot_wider(names_from = flow_parameter, values_from = value) %>% 
+  mutate(percent_t = percent_CD8_total + percent_CD4_total) %>% 
+  mutate(lymphocytic = percent_t > 20)
+
+tcell_sum = fig2_tcells %>% 
+  group_by(pna_type) %>% 
+  summarise(mean_tcells = mean(percent_t, na.rm = T), sd_tcells = sd(percent_t, na.rm = T), .groups = "keep")
+tcell_sum
+
+table(fig2_tcells$Diagnosis, fig2_tcells$lymphocytic)
+```
+
+   
+TRAM-like macs  
+```{r}
+fig2_tram = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_macs_CD206_high"))
+tram_mean = mean(fig2_tram$value, na.rm = T) #14.44%
+
+tram_comp = pairwise.wilcox.test(x = fig2_tram$value, 
+                                   g = fig2_tram$Diagnosis,
+                                   p.adjust.method = "fdr") #NSD
+
+tram_plot = ggplot(fig2_tram, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  ggtitle("CD206-high Macrophages")
+tram_plot
+```
+   
+MoAM-like   
+```{r}
+fig2_moam = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_macs_CD206_low"))
+moam_mean = mean(fig2_moam$value, na.rm = T) #10.45%
+
+moam_comp = pairwise.wilcox.test(x = fig2_moam$value, 
+                                   g = fig2_moam$Diagnosis,
+                                   p.adjust.method = "fdr") #NSD
+
+moam_plot = ggplot(fig2_moam, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  ggtitle("CD206-low Macrophages")
+moam_plot
+```
+   
+Monocytes   
+```{r}
+fig2_monocytes = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_monocytes"))
+mono_mean = mean(fig2_monocytes$value, na.rm = T) #8.92%
+
+monocytes_comp = pairwise.wilcox.test(x = fig2_monocytes$value, 
+                                   g = fig2_monocytes$Diagnosis,
+                                   p.adjust.method = "fdr")
+
+monocytes_plot = ggplot(fig2_monocytes, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia\nControl" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral\nPneumonia" = fig2_pal[3],
+                               "Other\nPneumonia" = fig2_pal[4])) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "none", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  ggtitle("Monocytes") +
+   geom_signif(comparisons = list(c("COVID-19", "Non-Pneumonia\nControl"),
+                                 c("Other Viral\nPneumonia", "Non-Pneumonia\nControl"),
+                                 c("Other\nPneumonia", "Non-Pneumonia\nControl"),
+                                 c("Other\nPneumonia", "COVID-19")), 
+              annotations = c(format(monocytes_comp$p.value["COVID-19", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(monocytes_comp$p.value["Other Viral\nPneumonia", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(monocytes_comp$p.value["Other\nPneumonia", "Non-Pneumonia\nControl"], digits = 2, scientific = T),
+                              format(monocytes_comp$p.value["Other\nPneumonia", "COVID-19"], digits = 2, scientific = T)),
+              y_position = c(45, 65, 75, 55), 
+              tip_length = 0,
+              aes(y = 1))
+monocytes_plot
+```
+
+   
+Ratios of AM   
+```{r eval=FALSE}
+fig2_macs = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_total_CD206_low", "percent_total_CD206_high"))
+fig2_moam = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_total_CD206_low"))
+fig2_tram = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_total_CD206_high"))
+
+moam_comp = pairwise.wilcox.test(x = fig2_moam$value, 
+                                   g = fig2_moam$Diagnosis,
+                                   p.adjust.method = "fdr") #NSD
+tram_comp = pairwise.wilcox.test(x = fig2_tram$value, 
+                                   g = fig2_tram$Diagnosis,
+                                   p.adjust.method = "fdr") #NSD
+
+macs_plot = ggplot(fig2_macs, aes(x = Diagnosis, y = value, fill = flow_parameter)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Macrophages") +
+  xlab("Diagnosis") +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  ggtitle("AM Ratios")
+macs_plot
+```
+   
+Superinfection and neutrophils   
+```{r}
+fig2_netrophils_super = data_long %>% 
+  dplyr::filter(!is.na(pna_type) & flow_parameter %in% c("percent_neutrophils"))
+
+fig2_netrophils_super$Diagnosis = str_wrap(fig2_netrophils_super$pna_type, width = 14)
+fig2_netrophils_super$Diagnosis = gsub("- ", "-", fig2_netrophils_super$Diagnosis)
+fig2_netrophils_super$Diagnosis = factor(fig2_netrophils_super$Diagnosis,
+                             levels = c("Non-Pneumonia\nControl","COVID-19", 
+                                        "Other Viral\nPneumonia", "Other\nPneumonia"))
+
+fig2_netrophils_super = fig2_netrophils_super %>% 
+  mutate(super_factor = factor(paste(Diagnosis, any_nonviral))) %>% 
+  mutate(Superinfection = factor(ifelse(any_nonviral == TRUE,
+                                        yes = "Co-Infection Detected",
+                                        no = "Primary Only")))
+super_comp = pairwise.wilcox.test(x = fig2_netrophils_super$value, 
+                                   g = fig2_netrophils_super$super_factor,
+                                   p.adjust.method = "fdr")
+
+coinfection_neutrophil_plot = ggplot(fig2_netrophils_super, aes(x = Diagnosis, y = value, fill = Superinfection)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  ylab("Percent of Total Cells") +
+  xlab("Diagnosis") +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.25, dodge.width = 0.5)) +
+  geom_signif(y_position=c(105), xmin=c(3.9), xmax=c(4.1),
+              annotation=c(format(super_comp$p.value["Other\nPneumonia TRUE", "Other\nPneumonia FALSE"],
+                                  digits = 2, scientific = T)), 
+              tip_length=0) +
+  scale_y_continuous(breaks = seq(from = 0, to = 100, by = 25))
+coinfection_neutrophil_plot
+
+co_infection_table = table(fig2_netrophils_super$Diagnosis, fig2_netrophils_super$Superinfection)
+co_infection_comps = pairwise.prop.test(co_infection_table, p.adjust.method = "fdr")
+infected_proportion_plot = ggplot(fig2_netrophils_super, aes(x = Diagnosis, fill = Superinfection)) +
+  geom_bar(position = "fill", width = 0.7) + 
+  geom_signif(comparisons = list(c("Other\nPneumonia", "Non-Pneumonia\nControl"),
+                                 c("COVID-19", "Non-Pneumonia\nControl")),
+              annotations = c(format(co_infection_comps$p.value["Other\nPneumonia", "Non-Pneumonia\nControl"], 
+                                     digits = 2, scientific = T),
+                              format(co_infection_comps$p.value["COVID-19", "Non-Pneumonia\nControl"], 
+                                     digits = 2, scientific = T)),
+              y_position = c(1.15, 1.05), 
+              tip_length = 0,
+              aes(y = 1), textsize = 12) +
+  ylab("Proportion") +
+  xlab("") +
+  scale_fill_npg(name = "") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25))
+infected_proportion_plot
+```   
+   
+COVID only, after initial   
+```{r}
+covid_only_on_intake = fig2_netrophils_super %>% 
+  dplyr::select(ID, day_of_intubation, Superinfection, covid_confirmed) %>% 
+  dplyr::filter(covid_confirmed == T & day_of_intubation >=0 & day_of_intubation <= 2) %>% 
+  dplyr::select(ID)
+covid_only_on_intake = as.character(covid_only_on_intake$ID)
+fig2_neutrophils_covid = fig2_netrophils_super %>% 
+  dplyr::filter(ID %in% covid_only_on_intake)
+super_table_covid = table(fig2_neutrophils_covid$Superinfection, 
+                          fig2_neutrophils_covid$neutrophilic, 
+                          useNA = "always")
+super_table_covid
+
+fig2_neutrophils_covid = fig2_neutrophils_covid %>% 
+  group_by(ID) %>% 
+  mutate(ever_neutrophilic = any(neutrophilic == "Neutrophilic")) %>% 
+  dplyr::select(ID, ever_neutrophilic, Superinfection) %>% 
+  unique()
+table(fig2_neutrophils_covid$Superinfection, fig2_neutrophils_covid$ever_neutrophilic)
+```
+
+   
+All cell types at D0
+```{r}
+fig2_data_all = fig2_data_0 %>% 
+  dplyr::filter(flow_parameter %in% c("percent_CD4_total", "percent_CD8_total",
+                                      "percent_macs_CD206_high", "percent_macs_CD206_low",
+                                      "percent_monocytes", "percent_neutrophils",
+                                      "percent_others"))
+d0_barplots = ggplot(fig2_data_all, aes(x = Diagnosis, fill = flow_parameter)) +
+  stat_summary(aes(y = value), fun = "mean", geom = "bar", position = "stack") +
+  scale_fill_npg(name = "",
+                     labels = c("percent_CD4_total" = "% CD4 T",
+                                "percent_CD8_total" = "% CD8 T",
+                                "percent_macs_CD206_high" = "% CD206-high Macrophages",
+                                "percent_macs_CD206_low" = "% CD206-low Macrophages",
+                                "percent_monocytes" = "% Monocytes",
+                                "percent_neutrophils" = "% Neutrophils",
+                                "percent_others" = "% Others"),
+                 guide = guide_legend(ncol = 2, byrow = T)) +
+  ylab("Percent of Total Cells") +
+  xlab("") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5),
+        legend.text = element_text(family = "Arial"))
+d0_barplots 
+```   
+   
+All cell types at D0
+```{r}
+fig2_data_all = fig2_data %>% 
+  dplyr::filter(flow_parameter %in% c("percent_CD4_total", "percent_CD8_total",
+                                      "percent_macs_CD206_high", "percent_macs_CD206_low",
+                                      "percent_monocytes", "percent_neutrophils",
+                                      "percent_others"))
+all_days_barplots = ggplot(fig2_data_all, aes(x = Diagnosis, fill = flow_parameter)) +
+  stat_summary(aes(y = value), fun = "mean", geom = "bar", position = "stack") +
+  scale_fill_npg(name = "",
+                     labels = c("percent_CD4_total" = "% CD4 T",
+                                "percent_CD8_total" = "% CD8 T",
+                                "percent_macs_CD206_high" = "% CD206-high Macrophages",
+                                "percent_macs_CD206_low" = "% CD206-low Macrophages",
+                                "percent_monocytes" = "% Monocytes",
+                                "percent_neutrophils" = "% Neutrophils",
+                                "percent_others" = "% Others"),
+                 guide = guide_legend(ncol = 2, byrow = T)) +
+  ylab("Percent of Total Cells") +
+  xlab("") +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  theme(legend.position = "bottom", 
+        text = element_text(family = "Arial"),
+        plot.title = element_text(hjust = 0.5))
+d0_barplots 
+```
+
+   
+### Join   
+All days (currently figure S2)   
+```{r}
+layout = "AAA\nAAA\nAAA\nBBB\nBBB\nBBB\n###\nCCC\nCCC\nCCC\nCCC\nD##\nD##"
+fig2_heatmap_gg_clustered = as.ggplot(all_clustered_nolegend)
+fig2_heatmap_gg_unclustered = as.ggplot(all_unclustered_nolegend)
+flow_plot_figS2 = fig2_heatmap_gg_clustered +
+  fig2_heatmap_gg_unclustered +
+  (combined_plot + xlab("")) +
+  (infected_proportion_plot + xlab("Diagnosis")) +
+    plot_layout(design = layout) +
+    plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 120))
+
+CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200726_flow_plot_v3_alldays.pdf",
+    width = 85,
+    height = 120, family = "Arial")
+flow_plot_figS2
+dev.off()
+
+heatmap_annotation = as.ggplot(all_clustered$gtable$grob[[7]])
+heatmap_legend = as.ggplot(all_clustered$gtable$grob[[8]])
+figS2_heatmap_legend = heatmap_annotation | (plot_spacer() / heatmap_legend)
+CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200726_flow_plot_v3_alldays_legend.pdf",
+    width = 30,
+    height = 30, 
+    family = "Arial")
+figS2_heatmap_legend
+dev.off()
+```
+   
+Just D0 (currently figure 2)   
+```{r}
+layout = "AAAAAAAAA#\nAAAAAAAAA#\nBBBBBBBBBB\nBBBBBBBBBB\nCCCCCDDDDD"
+fig2_heatmap_gg = as.ggplot(fig2_heatmap)
+flow_plot_fig2 = fig2_heatmap_gg +
+  (combined_plot_D0 +xlab("")) +
+  (d0_barplots + xlab("Diagnosis")) + (infected_proportion_plot + xlab("Diagnosis")) +
+    plot_layout(design = layout) +
+   plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 120))
+
+CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200726_flow_plot_v2_D0.pdf",
+    width = 75,
+    height = 100, 
+    family = "Arial")
+flow_plot_fig2
+dev.off()
+
+flow_plot_fig2
+```
+      
+## Compare individual parameters by group   
+### Neutrophils, CD206low and CD206high for D0 samples   
+```{r}
+single_param = data %>% 
+  dplyr::select(Sample, ID, day_of_intubation, covid_confirmed,
+                percent_neutrophils, percent_macs_CD206_low, percent_macs_CD206_high, percent_total_CD206_high) %>% 
+  dplyr::filter(day_of_intubation <= 2 & 
+                  day_of_intubation >= 0 &
+                  as.numeric(ID) >= 1211) %>% 
+  pivot_longer(cols = percent_neutrophils:percent_total_CD206_high,
+               names_to = "flow_parameter",
+               values_to = "percent")
+ggplot(single_param, aes(x = covid_confirmed, y = percent, fill = covid_confirmed)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.25) +
+  facet_wrap(~ flow_parameter) +
+  geom_signif(comparisons = list(c(1, 2)),
+              test = "wilcox.test",
+              tip_length = 0)
+```
+
+
+
+
+# Co-infection   
+## Proportion of microbe-infected individuals   
+### Plot   
+```{r}
+only_metadata = only_metadata %>%
+  rowwise() %>% 
+  mutate(infection_detected = !is.null(organism_name)) %>% 
+  ungroup()
+only_metadata$infection_detected[is.na(only_metadata$infection_detected)] = "Not Tested"
+only_metadata$infection_detected = factor(only_metadata$infection_detected,
+                                          levels = c("Not Tested", "TRUE", "FALSE"))
+ggplot(subset(only_metadata, !is.na(covid_confirmed)), aes(x = covid_confirmed, fill = infection_detected)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  scale_fill_manual(values = c("Not Tested" = "gray", "FALSE" = "cornflowerblue", "TRUE" = "firebrick"))
+```
+
+## Levels of infection   
+### Histograms of culture quantities   
+```{r}
+covid_organism_levels = only_metadata %>% 
+  dplyr::filter(covid_confirmed == T) %>% 
+  select(organism_quantity) %>% 
+  unlist()
+other_organism_levels = only_metadata %>% 
+  dplyr::filter(covid_confirmed == F) %>% 
+  select(organism_quantity) %>% 
+  unlist()
+ggplot(NULL) +
+  geom_density(aes(x = covid_organism_levels), fill = "firebrick", alpha = 0.5) +
+  geom_density(aes(x = other_organism_levels), fill = "cornflowerblue", alpha = 0.5)
+```
+
+## Infection type   
+### Word cloud   
+```{r}
+covid_organisms = as.character(only_metadata %>% 
+                                 dplyr::filter(covid_confirmed == T) %>% 
+                                 select(organism_name) %>% 
+                                 unlist() %>% 
+                                 na.omit())
+covid_organisms = gsub("[[:punct:]] | | [[:punct:]]|[[:punct:]]", "_", trimws(covid_organisms)) #so we can treat as one word
+covid_organisms = gsub("_$", "", covid_organisms)
+
+other_organisms = as.character(only_metadata %>%
+                                 dplyr::filter(covid_confirmed == F) %>% 
+                                 select(organism_name) %>% 
+                                 unlist() %>% 
+                                 na.omit())
+other_organisms = gsub("[[:punct:]] | | [[:punct:]]|[[:punct:]]", "_", trimws(other_organisms))
+other_organisms = gsub("_$", "", other_organisms)
+
+#make into data frame with normalized freqs
+df1 = data.frame(word = names(termFreq(covid_organisms)),
+                 freq = as.numeric(termFreq(covid_organisms)) / 
+                   sum(as.numeric(termFreq(covid_organisms))),
+                 covid_confirmed = T)
+df2 = data.frame(word = names(termFreq(other_organisms)),
+                 freq = as.numeric(termFreq(other_organisms)) /
+                   sum(as.numeric(termFreq(other_organisms))),
+                 covid_confirmed = F)
+
+#finally, plot
+wordcould_df = rbind(df1, df2)
+ggplot(wordcould_df, aes(label = word, size = freq)) +
+  geom_text_wordcloud(show.legend = F) +
+  facet_wrap(~ covid_confirmed)
+```
+
+### Specific organisms   
+Viridans Streptococcus
+```{r}
+metagenomics_data_a = only_metadata %>% 
+  unique() %>% 
+  unnest_longer(col = organism_name, simplify = T) %>% 
+  select(-c(Organism_ID, organism_quantity))
+metagenomics_data_b = only_metadata %>% 
+  unique() %>% 
+  unnest_longer(col = organism_quantity, simplify = T) %>% 
+  select(-c(Organism_ID))
+metagenomics_data_b$organism_quantity[is.na(metagenomics_data_b$organism_quantity)] = 0
+metagenomics_data = cbind(metagenomics_data_a, organism_quantity = metagenomics_data_b$organism_quantity) %>% 
+  pivot_wider(names_from = organism_name, 
+              values_from = organism_quantity)
+rm(metagenomics_data_a, metagenomics_data_b)
+
+viridans_data = metagenomics_data %>% 
+  select(ir_id, BAL_order_timestamp, covid_confirmed, 
+         `Viridans streptococcus`, `Viridans streptococcus #2`, 
+         `Viridans streptococcus #3`) %>% 
+  pivot_longer(cols = c(`Viridans streptococcus`, `Viridans streptococcus #2`, `Viridans streptococcus #3`),
+               names_to = "strain", values_to = "organism_quantity")
+viridans_data$organism_quantity[is.na(viridans_data$organism_quantity)] = 0
+ggplot(viridans_data, aes(x = covid_confirmed, y = organism_quantity, fill = strain)) +
+  geom_boxplot(outlier.shape = NA)
+```
+
+
+# Factor analysis   
+## Subset to usable factors   
+```{r}
+clinical_data = only_metadata %>% 
+  dplyr::filter(!is.na(BAL_order_date)) %>% #remove samples without BAL info
+  mutate(sample_id = paste(ir_id, BAL_order_timestamp, sep = "_")) %>% 
+  select(c(sample_id,
+           RBC_BODY_FLUID:Absolute_Neutrophils,
+           MACROPHAGE_BF:OTHER_CELLS_BODY_FLUID,
+           AMYLASE_BF,
+           WHITE_BLOOD_CELL_COUNT:D_DIMER, 
+           max_daily_temp)) %>% 
+  dplyr::filter(!duplicated(sample_id)) %>% #mostly due to NAs
+  column_to_rownames(var = "sample_id")
+```
+
+## PCA   
+### Calculation   
+```{r}
+safe_cols = function(x, proportion_present = 0.5)
+{
+  return(all(is.finite(na.omit(x))) & 
+           sd(x, na.rm = T) > 0 &
+           (sum(!is.na(x)) / (length(x)) > proportion_present))
+}
+keep_cols = apply(clinical_data, 2, safe_cols)
+pca_data = na.omit(clinical_data[, keep_cols])
+
+#need to use formula interface to deal with NAs because nothing is ever easy
+formula = paste0("~ ",
+                 paste(colnames(pca_data), collapse = "+"))
+formula = as.formula(formula)
+pca = prcomp(formula = formula,
+             data = pca_data, 
+             scale. = T,
+             na.action = na.omit)
+
+pca_data_complete = only_metadata %>% 
+  unique() %>%
+  mutate(sample_id = paste(ir_id, BAL_order_timestamp, sep = "_")) %>% 
+  dplyr::filter(sample_id %in% rownames(pca_data)) %>% 
+  column_to_rownames(var = "sample_id")
+```   
+
+### Screeplot   
+```{r}
+fviz_eig(pca)
+```
+
+
+### Biplot   
+```{r}
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         shape = "covid_confirmed",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 1,
+         y = 2)
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         shape = "covid_confirmed",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 2,
+         y = 3)
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         shape = "covid_confirmed",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 3,
+         y = 4)
+```   
+Some interesting loadings: PC1-2 is driven heavily by markers of sepsis and/or organ failure. PC3 appears to just broadly be immune response, but I find it interesting that CRP and monocytes (in this case from BAL) travel together. Are they the source of IL6? Is this a response to IL6? PC4 is similar, with influence of CRP and ferritin suggesting high levels of inflammation. Let's also try UMAP to see if there is some hidden structure.   
+
+### Calculation on fewer parameters   
+```{r}
+clinical_data_ltd = only_metadata %>% 
+  unique() %>% #oddly there is duplication
+  dplyr::filter(!is.na(BAL_order_date)) %>% #remove samples without BAL info
+  mutate(sample_id = paste(ir_id, BAL_order_timestamp, sep = "_")) %>% 
+  select(c(sample_id,
+           Absolute_Neutrophils,
+           WHITE_BLOOD_CELL_COUNT:D_DIMER, 
+           max_daily_temp)) %>% 
+  dplyr::filter(!duplicated(sample_id)) %>% #mostly due to NAs
+  column_to_rownames(var = "sample_id")
+
+keep_cols = apply(clinical_data_ltd, 2, safe_cols)
+pca_data = na.omit(clinical_data_ltd[, keep_cols])
+
+#need to use formula interface to deal with NAs because nothing is ever easy
+formula = paste0("~ ",
+                 paste(colnames(pca_data), collapse = "+"))
+formula = as.formula(formula)
+pca = prcomp(formula = formula,
+             data = pca_data, 
+             scale. = T,
+             na.action = na.omit)
+
+pca_data_complete = only_metadata %>% 
+  unique() %>%
+  mutate(sample_id = paste(ir_id, BAL_order_timestamp, sep = "_")) %>% 
+  dplyr::filter(sample_id %in% rownames(pca_data)) %>% 
+  dplyr::filter(!duplicated(sample_id)) %>% #mostly due to NAs
+  column_to_rownames(var = "sample_id")
+```
+
+### Biplot   
+```{r}
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 1,
+         y = 2)
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 2,
+         y = 3)
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 3,
+         y = 4)
+```  
+
+## UMAP    
+### Calculate UMAP   
+```{r}
+umap = umap(pca_data, 
+            n_neighbors = 15,
+            min_dist = 0.1,
+            scale = "Z")
+colnames(umap) = c("umap_1", "umap_2")
+umap_data = cbind(pca_data_complete, umap)
+```   
+
+### Plot
+```{r}
+ggplot(umap_data, aes(x = umap_1, y = umap_2, color = binned_outcome)) +
+  geom_point() +
+  stat_ellipse()
+```
+This doesn't seem to add much.   
+
+### Just D0 samples   
+```{r}
+clinical_day0 = only_metadata %>% 
+  unique() %>% #oddly there is duplication
+  dplyr::filter(!is.na(BAL_order_date) & day_of_intubation <= 2 & day_of_intubation >= 0) %>% #remove samples without BAL info
+  mutate(sample_id = paste(ir_id, BAL_order_timestamp, sep = "_")) %>% 
+  select(c(sample_id,
+           Absolute_Neutrophils,
+           WHITE_BLOOD_CELL_COUNT:D_DIMER, 
+           max_daily_temp)) %>% 
+  dplyr::filter(!duplicated(sample_id)) %>% #mostly due to NAs
+  column_to_rownames(var = "sample_id") %>% 
+  na.omit()
+keep_cols = apply(clinical_day0, 2, safe_cols)
+pca_data = clinical_day0[, keep_cols]
+
+pca_data_complete = only_metadata %>% 
+  unique() %>%
+  mutate(sample_id = paste(ir_id, BAL_order_timestamp, sep = "_")) %>% 
+  dplyr::filter(sample_id %in% rownames(pca_data)) %>% 
+  column_to_rownames(var = "sample_id")
+
+#need to use formula interface to deal with NAs because nothing is ever easy
+formula = paste0("~ ",
+                 paste(colnames(pca_data), collapse = "+"))
+formula = as.formula(formula)
+pca = prcomp(formula = formula,
+             data = pca_data, 
+             scale. = T,
+             na.action = na.omit)
+
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         shape = "covid_confirmed",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 1,
+         y = 2)
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         shape = "covid_confirmed",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 2,
+         y = 3)
+autoplot(pca, 
+         data = pca_data_complete, 
+         colour = "binned_outcome",
+         shape = "covid_confirmed",
+         loadings = TRUE, 
+         loadings.colour = alpha("blue", 0.1),
+         loadings.label = TRUE, 
+         loadings.label.size = 2,
+         loadings.label.colour = alpha("red", 0.7),
+         x = 3,
+         y = 4)
+```
+
+Not actually very different from complete dataset.   
+   
+## Key biomarkers   
+Include: CRP, D-dimer, ferritin, Procalcitonin, LDH, CPK and AST   
+   
+### Check for normality   
+```{r}
+shapiro.test(only_metadata$C_Reactive_Protein) #not normal
+hist(only_metadata$C_Reactive_Protein)
+shapiro.test(only_metadata$D_DIMER) #not normal
+hist(only_metadata$D_DIMER)
+shapiro.test(only_metadata$FERRITIN) #not normal
+hist(only_metadata$FERRITIN)
+shapiro.test(only_metadata$PROCALCITONIN) #not normal
+hist(only_metadata$PROCALCITONIN)
+shapiro.test(only_metadata$LDH) #not normal
+hist(only_metadata$LDH)
+shapiro.test(only_metadata$CREATINE_KINASE_TOTAL) #not normal
+hist(only_metadata$CREATINE_KINASE_TOTAL)
+```
+   
+### D0   
+Heatmap   
+```{r}
+biomarker_d0 = only_metadata %>% 
+  dplyr::filter(day_of_intubation >= 0 & day_of_intubation <= 2) %>% 
+  dplyr::select(C_Reactive_Protein, D_DIMER, FERRITIN,
+                PROCALCITONIN, LDH, CREATINE_KINASE_TOTAL,
+                Diagnosis = pna_type, tc_pt_study_id) 
+
+annotation_data = biomarker_d0 %>% 
+  select(tc_pt_study_id, Diagnosis) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "tc_pt_study_id")
+
+matrix_data = biomarker_d0 %>% 
+  select(tc_pt_study_id, C_Reactive_Protein:CREATINE_KINASE_TOTAL) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "tc_pt_study_id") %>% 
+  as.matrix() %>% 
+  t()
+
+rownames(matrix_data) = c("CRP", "D-Dimer", "Ferritin", 
+                          "Procalcitonin", "LDH", "CPK")
+
+pheatmap(mat = matrix_data, 
+         cluster_rows = F,
+         cluster_cols = F,
+         clustering_method = "ward.D2",
+         annotation_col = annotation_data,
+         scale = "row",
+         show_colnames = F,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101))
+```   
+Data are way too sparse. Need to go with boxplots or similar.   
+   
+Boxplots
+```{r}
+biomarkers = only_metadata %>% 
+  dplyr::select(CRP = C_Reactive_Protein, `D-Dimer` = D_DIMER, Ferritin = FERRITIN,
+                Procalcitonin = PROCALCITONIN, LDH, CPK = CREATINE_KINASE_TOTAL, 
+                SOFA = mean_sofa, APS = mean_aps,
+                Diagnosis = pna_type, tc_pt_study_id, day_of_intubation) %>% 
+  pivot_longer(cols = CRP:APS, 
+               names_to = "Biomarker",
+               values_to = "value") %>% 
+  dplyr::filter(!is.na(Diagnosis)) %>% 
+  mutate(Biomarker = factor(Biomarker))
+biomarker_d0 = biomarkers %>% 
+  dplyr::filter(day_of_intubation >= 0 & day_of_intubation <= 2)
+
+comps = lapply(levels(biomarker_d0$Biomarker), function(x){
+  sub = subset(biomarker_d0, Biomarker == x)
+  comp = pairwise.wilcox.test(x = sub$value, g = sub$Diagnosis, p.adjust.method = "none")$p.value %>%
+    as.data.frame() %>% 
+    rownames_to_column("comp1") %>% 
+    pivot_longer(cols = 2:ncol(.), names_to = "comp2", values_to = "pval") %>% 
+    dplyr::filter(!is.na(pval)) %>% 
+    mutate(Biomarker = x)
+  return(comp) })
+all_comps = bind_rows(comps) %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  mutate(annot = format(padj, digits = 2, scientific = T))
+all_comps$y = c(log10(800))
+                         
+
+biomarker_plot_d0 = ggplot(biomarker_d0, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  #add "healthy" zones
+  geom_rect(data = subset(biomarker_d0, Biomarker == "CRP")[1,], #alpha doesn't work with multitple rows :')
+            xmin = -Inf, 
+            xmax = Inf, 
+            ymin = -Inf,
+            ymax = log10(10),
+            fill = fig2_pal[7],
+            alpha = 0.4) +
+  geom_rect(data = subset(biomarker_d0, Biomarker == "D-Dimer")[1,],
+            xmin = -Inf, 
+            xmax = Inf, 
+            ymin = -Inf,
+            ymax = log10(229),
+            fill = fig2_pal[7],
+            alpha = 0.4) +
+    geom_rect(data = subset(biomarker_d0, Biomarker == "Procalcitonin")[1,], 
+            xmin = -Inf, 
+            xmax = Inf, 
+            ymin = -Inf,
+            ymax = log10(6.5e-2),
+            fill = fig2_pal[7],
+            alpha = 0.4) +
+  geom_rect(data = subset(biomarker_d0, Biomarker == "Ferritin")[1,], 
+            xmin = -Inf, 
+            xmax = Inf, 
+            ymin = log10(24),
+            ymax = log10(336),
+            fill = fig2_pal[7],
+            alpha = 0.4) +
+  geom_rect(data = subset(biomarker_d0, Biomarker == "LDH")[1,], 
+            xmin = -Inf, 
+            xmax = Inf, 
+            ymin = -Inf,
+            ymax = log10(271),
+            fill = fig2_pal[7],
+            alpha = 0.4) +
+  geom_rect(data = subset(biomarker_d0, Biomarker == "CPK")[1,], 
+            xmin = -Inf, 
+            xmax = Inf, 
+            ymin = -Inf,
+            ymax = log10(223),
+            fill = fig2_pal[7],
+            alpha = 0.4) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter() +
+  facet_wrap(~ Biomarker, scales = "free_y", ) +
+  scale_fill_manual(name = "",
+                    values = c("Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4]),
+                    guide = guide_legend(ncol = 2)) +
+  scale_y_log10() +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  xlab("") +
+  ylab("") +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        strip.background = element_blank()) +
+  geom_signif(inherit.aes = F, 
+              data = all_comps,
+              aes(xmin = comp1, xmax = comp2, annotations = annot, y_position = y),
+              tip_length = 0,
+              manual=TRUE, 
+              textsize = 12)
+
+CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200705_biomarkers_d0_v2.pdf",
+    width = 30,
+    height = 25, family = "Arial")
+biomarker_plot_d0
+dev.off()
+
+biomarker_plot_d0
+```   
+  
+### Compare CRP against "normal" range   
+I think the most conservative approach is to compare against the upper limit of "normal": 10mg/L   
+   
+```{r}
+
+```
+
+  
+### All days   
+```{r eval=FALSE}
+comps = lapply(levels(biomarkers$Biomarker), function(x){
+  sub = subset(biomarkers, Biomarker == x)
+  comp = pairwise.wilcox.test(x = sub$value, g = sub$Diagnosis, p.adjust.method = "fdr")
+  return(comp) })
+names(comps) = levels(biomarkers$Biomarker)
+comps                 
+annotation_df = data.frame(Biomarker=c(rep("CRP", 2), rep("Ferritin", 2)), 
+                            start=c("Non-Pneumonia Control", "COVID-19",
+                                    "Non-Pneumonia Control", "COVID-19"), 
+                            end=c("COVID-19", "Other Pneumonia",
+                                  "COVID-19", "Other Pneumonia"),
+                            y = log10(c(90, 180, 15e3, 40e3)),
+                            label=c(format(comps$CRP$p.value["COVID-19", "Non-Pneumonia Control"], digits = 2, scientific = T),
+                                    format(comps$CRP$p.value["Other Pneumonia", "COVID-19"], digits = 2, scientific = T),
+                                    format(comps$Ferritin$p.value["COVID-19", "Non-Pneumonia Control"], digits = 2, scientific = T),
+                                    format(comps$Ferritin$p.value["Other Pneumonia", "COVID-19"], digits = 2, scientific = T)))
+
+
+biomarker_plot = ggplot(biomarkers, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(size = 0.1) +
+  facet_wrap(~ Biomarker, scales = "free_y") +
+  scale_fill_npg(name = "", guide = guide_legend(nrow = 2)) +
+  theme_bw(base_family = "Arial", base_size = 75) +
+  xlab("") +
+  ylab("") +
+  theme(legend.position = "bottom",
+        text = element_text(family = "Arial"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        strip.background = element_blank()) +
+  geom_signif(inherit.aes = F, 
+              data = annotation_df,
+              aes(xmin = start, xmax = end, annotations = label, y_position = y),
+              tip_length = 0,
+              manual=TRUE)
+biomarker_plot
+```  
+# Figure S1   
+## Alluvial plots   
+### Organize data   
+   
+By sample   
+```{r}
+bulk_md = read.csv("~/Box/RGrant/SCRIPT/200730_bulk_mp_metadata.csv")
+sc_samples = c("1252-BAL-00", "1240-BAL-00", "1266-BAL-00",
+               "1239-BAL-00", "1241-BAL-00", "1254-BAL-00")
+
+#track each sample across analysis process
+alluvial_data_samples =  total_metadata %>% 
+  dplyr::select(study_id, tc_pt_study_id, Diagnosis = pna_type) %>% 
+  rownames_to_column("sample_index") %>% 
+  mutate(BAL = TRUE,
+         `Flow Cytometry` = tc_pt_study_id %in% data$tc_pt_study_id,
+         `Bulk RNA-seq` = tc_pt_study_id %in% bulk_md$tc_pt_study_id,
+         `Single-Cell RNA-seq` = tc_pt_study_id %in% sc_samples) %>% 
+  pivot_longer(cols = BAL:`Single-Cell RNA-seq`,
+               names_to = "Analysis",
+               values_to = "performed") %>% 
+  dplyr::filter(performed == T & !is.na(Diagnosis)) %>% 
+  dplyr::select(-performed)
+alluvial_data_samples$Analysis = factor(alluvial_data_samples$Analysis,
+                                        levels = c("BAL", "Flow Cytometry",
+                                                   "Bulk RNA-seq", "Single-Cell RNA-seq"))
+
+#fix issue with the healthy controls and two SC samples not having flow
+missing_samples_na = subset(alluvial_data_samples,
+                            Diagnosis == "Healthy Control" & Analysis == "BAL")
+missing_samples_na$Diagnosis = "NA"
+missing_samples_na$Analysis = "Flow Cytometry"
+missing_samples_na = rbind(missing_samples_na,
+                             data.frame(sample_index = c(253, 378, 378, 450, 472, 645, 738),
+                                        study_id = c(1252, 1240, 1240, 1266, 1239, 1241, 1254),
+                                        tc_pt_study_id = c("1252-BAL-00", "1240-BAL-00", "1240-BAL-00", "1266-BAL-00",
+                                                           "1239-BAL-00", "1241-BAL-00", "1254-BAL-00"),
+                                        Diagnosis = rep("NA", 7),
+                                        Analysis = c("Flow Cytometry", "Flow Cytometry", "Bulk RNA-seq", "Bulk RNA-seq", 
+                                                     "Flow Cytometry", "Flow Cytometry", "Flow Cytometry")))
+alluvial_data_samples = rbind(alluvial_data_samples,
+                              missing_samples_na)
+alluvial_data_samples$Diagnosis = factor(alluvial_data_samples$Diagnosis,
+                                         levels = c("NA", "Healthy Control", "Non-Pneumonia Control", "COVID-19", 
+                                    "Other Viral Pneumonia", "Other Pneumonia"))
+alluvial_data_samples$hide = factor(alluvial_data_samples$Diagnosis == "NA")
+```   
+   
+By patient   
+```{r}
+alluvial_data_patients = alluvial_data_samples %>% 
+  dplyr::select(-c(tc_pt_study_id)) %>% 
+  group_by(study_id, Analysis) %>% 
+  slice_head()
+```
+
+   
+### Plot   
+   
+By sample   
+```{r}
+alluvial_sample = ggplot(alluvial_data_samples, aes(x = Analysis, stratum = Diagnosis, alluvium = sample_index,
+                                  fill = Diagnosis, label = Diagnosis)) +
+  scale_fill_manual(name = "",
+                    values = c("NA" = fig2_pal[6],
+                               "Healthy Control" = fig2_pal[6],
+                               "Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4])) +
+  geom_alluvium() +
+  geom_stratum(aes(alpha = hide, color = hide)) +
+  scale_color_manual(name = "",
+                      values = c("FALSE" = "black",
+                               "TRUE" = alpha("white", 0))) +
+  scale_alpha_manual(name = "",
+                      values = c("FALSE" = 1,
+                               "TRUE" = 0)) +
+  theme_bw(base_size = 75, base_family = "Arial") +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background=element_blank(),
+        panel.border=element_blank(),panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),plot.background=element_blank()) +
+  ggtitle("BAL Samples")
+```
+   
+By patient   
+```{r}
+alluvial_patient = ggplot(alluvial_data_patients, aes(x = Analysis, stratum = Diagnosis, alluvium = sample_index,
+                                  fill = Diagnosis, label = Diagnosis)) +
+  scale_fill_manual(name = "",
+                    values = c("NA" = fig2_pal[6],
+                               "Healthy Control" = fig2_pal[6],
+                               "Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4])) +
+  geom_alluvium() +
+  geom_stratum(aes(alpha = hide, color = hide)) +
+  scale_color_manual(name = "",
+                      values = c("FALSE" = "black",
+                               "TRUE" = alpha("white", 0))) +
+  scale_alpha_manual(name = "",
+                      values = c("FALSE" = 1,
+                               "TRUE" = 0)) +
+  theme_bw(base_size = 75, base_family = "Arial") +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background=element_blank(),
+        panel.border=element_blank(),panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),plot.background=element_blank()) +
+  ggtitle("SCRIPT Patients")
+```   
+   
+## Join   
+```{r}
+layout = "A\nA\nB\nB\nC\nC\nC\nC"
+figure_s1 = alluvial_patient +
+  alluvial_sample +
+  biomarker_plot_d0 +
+    plot_layout(design = layout) +
+    plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 120))
+
+CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200730_figure_S1.pdf",
+    width = 60,
+    height = 100, family = "Arial")
+figure_s1
+dev.off()
+
+```
+

@@ -1,0 +1,89 @@
+---
+title: "SARS-CoV-2 Coverage"
+output: html_notebook
+---
+
+# Goals   
+1. Generate a coverage map of the entire SARS-CoV-2 genome to determine how to best measure replication based on antisense reads, if at all   
+   
+# Setup   
+## Load packages   
+```{r setup}
+library(GenomicAlignments)
+library(parallel)
+library(doParallel)
+registerDoParallel(makeCluster(12))
+```
+   
+## Load in bam files from confirmed covid patients   
+```{r}
+bulk = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200708_script_bulk_des_no_hURNA.rds")
+md = as.data.frame(colData(bulk))
+covid_tubes = rownames(subset(md, covid_confirmed == T))
+
+seq_dirs = dir(path = "/projects/b1038/Pulmonary/rgrant/script_bulk",
+               pattern = "^(\\d|S).*",
+               all.files = F, 
+               full.names = T, 
+               recursive = F)
+bams = lapply(seq_dirs, function(x){
+  dir = paste0(x, "/results/markDuplicates")
+  bam_files = list.files(dir,
+                         pattern = "\\.bam$",
+                         full.names = T)
+  return(bam_files) })
+bams = unlist(bams)
+bams = data.frame(path = bams,
+                  tube = substring(basename(bams), 1, 9)) %>% 
+  dplyr::filter(tube %in% covid_tubes)
+
+indexes = lapply(seq_dirs, function(x){
+  dir = paste0(x, "/results/markDuplicates")
+  bam_files = list.files(dir,
+                         pattern = "\\.bam\\.bai$",
+                         full.names = T)
+  return(bam_files) })
+indexes = unlist(indexes)
+indexes = data.frame(path = indexes,
+                  tube = substring(basename(indexes), 1, 9)) %>% 
+  dplyr::filter(tube %in% covid_tubes)
+
+alignments = foreach(i = 1:nrow(bams)) %dopar%
+{
+  library(GenomicAlignments) #have to load on each core
+  cur = readGAlignments(file = bams$path[i],
+                        index = indexes$path[i])
+  return(cur)
+}
+```
+   
+## Join alignments together and isolate CoV-2   
+```{r}
+merged_alignments = do.call(c, alignments) #iteratively join together
+#subset into positive and negative strands and isolate coverage
+cov2_coverage_negative = coverage(merged_alignments[strand(merged_alignments) == "-" &
+                                                      seqnames(merged_alignments) == "NC_045512.2"])
+cov2_coverage_positive = coverage(merged_alignments[strand(merged_alignments) == "+" &
+                                                      seqnames(merged_alignments) == "NC_045512.2"])
+#subset to CoV2
+cov2_coverage_negative = cov2_coverage_negative$NC_045512.2
+cov2_coverage_positive = cov2_coverage_positive$NC_045512.2
+#join into decompressed data frame
+cov2_coverage = data.frame(nucleotide_position = c(1:29903), 
+                           negative = as.numeric(cov2_coverage_negative),
+                           positive = as.numeric(cov2_coverage_positive)) %>% 
+  pivot_longer(cols = c(negative, positive),
+               names_to = "strand",
+               values_to = "coverage")
+```
+   
+# Analysis   
+## Plot coverage   
+### Density
+```{r}
+ggplot(cov2_coverage, aes(x = nucleotide_position, y = coverage, color = strand)) +
+  facet_wrap(~strand, scales = "free_y") +
+  geom_line()
+```
+
+Why is this reverse? Counts are correct.

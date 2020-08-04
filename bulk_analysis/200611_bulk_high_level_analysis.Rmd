@@ -1,0 +1,1923 @@
+---
+title: "SCRIPT Bulk High-Level Analysis"
+output: html_notebook
+---
+
+# Goals   
+1. Identify transcriptional patterns in AM associated with IAV, COVID-19, and common to both   
+2. Determine source of IL6 and IL1B in the lung (if possible)   
+   
+# Setup   
+## Load packages   
+```{r setup}
+library(ggplot2)
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+library(patchwork)
+library(factoextra)
+library(parallel)
+library(uwot)
+library(WGCNA)
+library(ggsci)
+library(topGO)
+library(GO.db)
+library(org.Hs.eg.db)
+library(parallel)
+library(doParallel)
+library(biomaRt)
+registerDoParallel(makeCluster(12))
+register(MulticoreParam(12))
+options(gsubfn.engine = "R")
+set.seed(12345)
+source("~/utils/R/pretty_MA_plot.R")
+source("~/utils/R/k_means_figure.R")
+source("~/utils/R/plotPCA_manual.R")
+fig2_pal = pal_npg("nrc")(9)
+
+sessionInfo()
+```
+
+## Import data   
+```{r}
+mp = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_script_bulk_des_no_hURNA.rds")
+mp$covid_confirmed = factor(mp$covid_confirmed)
+mp$sex = factor(mp$gender)
+
+#set up for comparison by diagnosis
+mp$Diagnosis = gsub("-| ", "_", as.character(mp$pna_type))
+mp$Diagnosis = factor(mp$Diagnosis, 
+                      levels = c("Healthy_Control", "Non_Pneumonia_Control", "COVID_19", 
+                                 "Other_Viral_Pneumonia", "Other_Pneumonia"))
+mp$neutrophilic = mp$percent_neutrophils > 50
+#for modeling, etc
+mp$finite_day_of_intubation = mp$day_of_intubation
+mp$finite_day_of_intubation[is.infinite(mp$finite_day_of_intubation)] = NA
+mp$day0_sample = factor(mp$day_of_intubation >= 0 & mp$day_of_intubation <=2)
+mp$day0_sample[is.na(mp$day0_sample)] = FALSE
+design(mp) = as.formula("~ Diagnosis")
+metadata = as.data.frame(colData(mp))
+```   
+   
+## Summary stats   
+### Number of samples overall   
+```{r}
+table(mp_des$covid_confirmed)
+```
+
+### Number of serial samples   
+```{r}
+n_samples = table(metadata$patient_id)
+serial_patients = names(n_samples[n_samples > 1])
+length(serial_patients)
+```   
+   
+### Distribution of days   
+```{r}
+ggplot(metadata, aes(x = day_of_intubation)) +
+  geom_histogram(fill = "dodgerblue4")
+```
+   
+## PCA   
+### Calculate and organize   
+```{r}
+mp_vst = vst(mp, nsub = 3000, fitType = "local") #know from later that local is best
+mp_counts = counts(estimateSizeFactors(mp), normalized = T)
+pca_data = plotPCA_manual(mp_vst,
+                          intgroup = c("covid_confirmed"),
+                          pcs = 10)
+pca_data$data = left_join(pca_data$data,
+                     as.data.frame(colData(mp)),
+                     by = c("name" = "sample", "covid_confirmed"))
+
+#merge counts and pca data
+gene_conv = as.data.frame(rowData(mp)) %>% 
+  rownames_to_column(var = "ensembl_gene_id")
+merge_counts = mp_counts %>% 
+  t() %>%
+  as.data.frame() %>% 
+  rownames_to_column(var = "name")
+
+#merge together for featureplot dataset
+fp_data = left_join(pca_data$data, merge_counts, by = "name")
+```
+
+### How many PCs?   
+```{r}
+#scree plot   
+fviz_eig(pca_data$pca, 
+         barfill = "dodgerblue4", 
+         xlab = "Principal Component",
+         ylab = "Percent Variance Explained", 
+         main = "",
+         ncp = 50,
+         ggtheme = theme_bw(),
+         addlabels = T) #4-5 PCs will do it
+```
+   
+### Examine loadings   
+```{r}
+loadings = pca_data$pca$rotation %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "ensembl_gene_id") %>% 
+  right_join(gene_conv, .)
+```
+
+   
+### PC1: MoAM Character   
+```{r}
+ggplot(fp_data, aes(x = PC1, y = PC2, shape = covid_confirmed, color = percent_total_CD206_high)) +
+  geom_point(size = 3)
+fabp4_plot = ggplot(fp_data, aes(x = PC1, y = PC2, color = log2(ENSG00000170323))) +
+  geom_point() +
+  scale_color_viridis(name = "Log2(FABP4 Counts)")
+spp1_plot = ggplot(fp_data, aes(x = PC1, y = PC2, color = log2(ENSG00000118785))) +
+  geom_point() +
+  scale_color_viridis(name = "Log2(SPP1 Counts)")
+fabp4_plot + spp1_plot
+```   
+    
+### PC2: Patterns of activation (also by milieu)   
+```{r}
+ggplot(fp_data, aes(x = PC1, y = PC2, shape = covid_confirmed, color = C_Reactive_Protein)) +
+  geom_point(size = 3)
+ggplot(fp_data, aes(x = PC1, y = PC2, shape = covid_confirmed, color = LDH)) +
+  geom_point(size = 3)
+ggplot(fp_data, aes(x = PC1, y = PC2, shape = covid_confirmed, color = FERRITIN)) +
+  geom_point(size = 3)
+inhba_plot = ggplot(fp_data, aes(x = PC1, y = PC2, color = log2(ENSG00000122641))) +
+  geom_point() +
+  scale_color_viridis(name = "Log2(INHBA)")
+il1b_plot = ggplot(fp_data, aes(x = PC1, y = PC2, color = log2(ENSG00000125538))) +
+  geom_point() +
+  scale_color_viridis(name = "Log2(IL1b)")
+```
+After adding healthy controls this is longer true.   
+
+   
+### PC3: Male/female?   
+```{r}
+ggplot(fp_data, aes(x = PC2, y = PC3, color = gender)) +
+  geom_point(size = 3)
+xist_plot = ggplot(fp_data, aes(x = PC2, y = PC3, color = log2(ENSG00000229807))) +
+  geom_point() +
+  scale_color_viridis(name = "Log2(XIST)")
+```   
+Not really   
+   
+### Condition
+```{r}
+ggplot(fp_data, aes(x = PC1, y = PC2, color = Diagnosis)) +
+  geom_point(size = 2) +
+  stat_ellipse()
+```   
+   
+### Day of intubation
+```{r}
+ggplot(fp_data, aes(x = PC1, y = PC2, color = log2(day_of_intubation))) +
+  geom_point(size = 3)
+```   
+No clear separation.   
+   
+## Determine best dispersion estimates   
+### Parametric   
+```{r}
+#note: DESeq is refitting far too many genes. Need to turn this off.
+mp_des_parametric = DESeq(mp, 
+                          fitType = "parametric",
+                          parallel = T,
+                          minReplicatesForReplace = Inf)
+plotDispEsts(mp_des_parametric, cex = 0.1)
+```   
+   
+This fit really isn't bad, but overestimates at lower expression (probably not a huge deal).   
+    
+### Local
+```{r}
+mp_des_local = DESeq(mp,
+                     fitType = "local",
+                     parallel = T,
+                     minReplicatesForReplace=Inf)
+plotDispEsts(mp_des_local, cex = 0.1)
+
+mp_des = mp_des_local
+rm(mp_des_local, mp_des_parametric)
+```  
+Still not perfect, but a lot better.   
+   
+```{r}
+#used a few times later; safest to put here
+#identify infected samples
+non_human_genes = subset(gene_conv, !(grepl("^ENSG", ensembl_gene_id))) #human genes all have this prefix
+non_human_genes$gene_name[non_human_genes$ensembl_gene_id == "gene-UJ99_s6gp1"] = "NA" #neuraminidase was misread
+non_human_genes$virus = factor(ifelse(grepl("UJ99", non_human_genes$ensembl_gene_id),
+                               yes = "Influenza A/California/07/2009",
+                               no = "SARS-CoV-2"))
+cov2_genes = subset(non_human_genes, grepl("SARS|GU280", ensembl_gene_id))
+iav_genes = subset(non_human_genes, grepl("UJ99", ensembl_gene_id))
+flu_counts = counts(mp_des, normalized = T)[iav_genes$ensembl_gene_id, ]
+flu_detected = colnames(flu_counts[, colSums(flu_counts) > 0])
+cov2_counts = counts(mp_des, normalized = T)[cov2_genes$ensembl_gene_id, ]
+cov2_detected = colnames(cov2_counts[, colSums(cov2_counts) > 0])
+mp_des$sars_cov2_detected = factor(mp_des$sample %in% cov2_detected)
+mp_des$iav_h1n1_detected = factor(mp_des$sample %in% flu_detected)
+
+## Replicating CoV2 samples
+### overall
+antisense_counts = cov2_counts["SARS_CoV_2_antisense_genome", ]
+sense_counts = cov2_counts[2:nrow(cov2_counts), ]
+replicating_cov2 = intersect(names(antisense_counts)[antisense_counts > 0],
+                             colnames(sense_counts[, colSums(sense_counts) > 0]))
+### just covid
+percent_detected_covid = length(unique(subset(metadata, sample %in% cov2_detected & covid_confirmed == TRUE)$study_id)) / length(unique(subset(metadata, covid_confirmed == TRUE)$study_id)) * 100
+percent_detected_covid
+percent_replicating_covid = length(unique(subset(metadata, sample %in% replicating_cov2 & covid_confirmed == TRUE)$study_id)) / length(unique(subset(metadata, covid_confirmed == TRUE)$study_id)) * 100
+percent_replicating_covid
+
+percent_replicating_covid / percent_detected_covid * 100
+```
+      
+## Sanity checks  
+### SARS-CoV-2   
+Does expression of viral genes correlate with covid diagnosis?   
+```{r}
+cov2_counts = lapply(cov2_genes$ensembl_gene_id, function(x){
+  counts = plotCounts(mp,
+                      gene = x,
+                      intgroup = "Diagnosis",
+                      returnData = T, 
+                      pc = T)
+  counts$gene = x
+  return(counts)})
+cov2_counts = bind_rows(cov2_counts)
+
+ggplot(cov2_counts, aes(x = Diagnosis, y = count, fill = gene)) +
+  geom_boxplot() +
+  scale_y_log10()
+```   
+Now that we have all of the necessary metadata, this looks fantastic.  
+   
+
+      
+### Do counts cluster by virus and diagnosis?   
+```{r}
+viral_counts = counts(mp_des, normalized = T) 
+viral_counts = viral_counts[non_human_genes$ensembl_gene_id, ]
+viral_counts = log10(viral_counts + 0.5)
+
+virus_detection = vector(mode = "character", length = ncol(mp_des))
+for(i in 1:ncol(mp_des))
+{
+  has_covid = mp_des$covid_confirmed[i] == TRUE
+  has_iav_h1n1 = mp_des$INFLUENZA_A_H1_2009[i] == "Positive"
+  has_other_coronavirus = mp_des$any_coronavirus_non_covid[i] == TRUE
+  #recode NA as FALSE for safety
+  if(is.na(has_iav_h1n1)) 
+  {
+    has_iav_h1n1 = FALSE
+  }
+  if(is.na(has_other_coronavirus)) 
+  {
+    has_other_coronavirus = FALSE
+  }
+  
+  if(has_covid == TRUE && has_iav_h1n1 == TRUE && has_other_coronavirus == TRUE)
+  {
+    virus_detection[i] = "SARS-CoV-2 & Other Coronavirus & Influenza A/California/07/2009"
+  } else if(has_covid == TRUE && has_iav_h1n1 == FALSE && has_other_coronavirus == FALSE)
+  {
+    virus_detection[i] = "SARS-CoV-2"
+  } else if(has_covid == FALSE && has_iav_h1n1 == TRUE && has_other_coronavirus == FALSE)
+  {
+    virus_detection[i] = "Influenza A/California/07/2009"
+  } else if(has_covid == FALSE && has_iav_h1n1 == FALSE && has_other_coronavirus == TRUE)
+  {
+     virus_detection[i] = "Other Coronavirus"
+  } else if(has_covid == TRUE && has_iav_h1n1 == TRUE && has_other_coronavirus == FALSE)
+  {
+    virus_detection[i] = "SARS-CoV-2 & Influenza A/California/07/2009"
+  } else if(has_covid == TRUE && has_iav_h1n1 == FALSE && has_other_coronavirus == TRUE)
+  {
+    virus_detection[i] = "SARS-CoV-2 & Other Coronavirus"
+  } else if(has_covid == FALSE && has_iav_h1n1 == TRUE && has_other_coronavirus == TRUE)
+  {
+    virus_detection[i] = "Other Coronavirus & Influenza A/California/07/2009"
+  } else
+  {
+    virus_detection[i] = NA
+  }
+}
+mp_des$detected_viruses = factor(virus_detection)
+  
+diagnosis_annotation = as.data.frame(colData(mp_des)) %>% 
+  dplyr::select(Diagnosis = detected_viruses)
+gene_annotation = non_human_genes %>% 
+  remove_rownames() %>% 
+  column_to_rownames("ensembl_gene_id") %>% 
+  dplyr::select(`Viral Origin` = virus)
+gene_names = non_human_genes$gene_name
+gene_names[gene_names == "SARS_CoV_2_antisense_genome"] = "Antisense"
+
+viral_expression_heatmap = pheatmap(viral_counts,
+        clustering_method = "ward.D2",
+        show_colnames = F,
+        color = inferno(100),
+        annotation_col = diagnosis_annotation,
+        annotation_row = gene_annotation,
+        labels_row = gene_names,
+        annotation_colors = list(Diagnosis = c("SARS-CoV-2" = fig2_pal[1], "Other Coronavirus" = fig2_pal[2],
+                                                "Influenza A/California/07/2009" = fig2_pal[3], "Other Coronavirus & Influenza A/California/07/2009" = fig2_pal[4]),
+                                  `Viral Origin` = c("SARS-CoV-2" = fig2_pal[1], "Influenza A/California/07/2009" = fig2_pal[3])),
+        angle_col = 45, 
+        annotation_names_row = F)
+```
+   
+### Patient 1174   
+This patient apparently met criteria for COVID well before the first known cases in Chicago   
+```{r}
+cov2_counts = counts(mp_des, normalized = T)[cov2_genes$ensembl_gene_id, ]
+samples_1174 = mp_des$study_id == "1174"
+samples_1174[is.na(samples_1174)] = FALSE
+tubes_1174 = mp_des$sample[samples_1174]
+cov2_counts_1174 = cov2_counts[, tubes_1174]
+cov2_counts_1174
+```
+No detection, at least in macrophages.   
+   
+### Do CoV2 reads decrease over time?   
+Checking for viral clearance   
+```{r}
+covid_cases = mp_des[, mp_des$covid_confirmed == TRUE]
+covid_counts = counts(covid_cases, normalized = T)
+covid_counts = covid_counts[cov2_genes$ensembl_gene_id, ]
+
+covid_counts = covid_counts %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "gene") %>% 
+  pivot_longer(cols = "340195046":"340239867",
+               names_to = "sample",
+               values_to = "Counts") %>% 
+  left_join(., non_human_genes, by = c("gene" = "ensembl_gene_id")) %>% 
+  dplyr::select(-c(gene, virus)) %>% 
+  left_join(., as.data.frame(colData(mp_des)), by = "sample")
+
+ggplot(covid_counts, aes(x = day_of_intubation, y = Counts)) +
+  facet_wrap(~ gene_name, scales = "free_y") +
+  geom_point() +
+  geom_smooth(se = F)
+```   
+Unfortunately this is somewhat binarized. Better to treat it as such.   
+   
+```{r}
+covid_counts_binarized = covid_counts %>% 
+  group_by(sample) %>% 
+  mutate(all_viral_counts = sum(Counts)) %>% 
+  dplyr::select(sample, all_viral_counts, day_of_intubation) %>% 
+  unique() %>% 
+  mutate(virus_detected = all_viral_counts > 0)
+
+cor.test(covid_counts_binarized$all_viral_counts, covid_counts_binarized$day_of_intubation, method = "spearman")
+
+ggplot(covid_counts_binarized, aes(x = day_of_intubation, y = all_viral_counts)) +
+  geom_point() +
+  scale_y_continuous(trans = "log2") +
+  geom_smooth(se = F)
+```
+
+## Export for modeling core   
+```{r eval=FALSE}
+col_types = unlist(lapply(metadata, class))
+list_cols = names(col_types[col_types == "AsIs"])
+safe_metadata = metadata %>% 
+  dplyr::select(-c(all_of(list_cols))) %>% 
+  as.data.frame()
+write.csv(safe_metadata, "/projects/b1038/Pulmonary/Workspace/COVID19_bal_ms/200709_bulk_metadata.csv")
+write.csv(counts(mp_des, normalized = F), "/projects/b1038/Pulmonary/Workspace/COVID19_bal_ms/200709_bulk_counts_raw.csv")
+write.csv(counts(mp_des, normalized = T), "/projects/b1038/Pulmonary/Workspace/COVID19_bal_ms/200709_bulk_counts_deseq2_normalized.csv")
+```
+      
+## Which samples are worth sequencing further?   
+### First batch   
+```{r eval=FALSE}
+good_samples = mp_des[, ((!is.na(mp_des$RIN) & mp_des$RIN >= 7) & 
+                    mp_des$STAR_mqc_generalstats_star_uniquely_mapped_percent >= 30 &
+                    mp_des$featureCounts_mqc_generalstats_featurecounts_percent_assigned >= 30) &
+                    mp_des$RNA_concentration_pg_ul >= 125 |
+                    (mp_des$iav_h1n1_detected == TRUE | mp_des$sars_cov2_detected == TRUE)]
+
+selection_data = as.data.frame(colData(good_samples)) %>% 
+  dplyr::select(sample, tc_pt_study_id, RIN, STAR_mqc_generalstats_star_uniquely_mapped_percent,
+         featureCounts_mqc_generalstats_featurecounts_percent_assigned, iav_h1n1_detected, 
+         sars_cov2_detected, covid_confirmed, batch, RNA_concentration_pg_ul, pna_type)
+selection_data
+```   
+Keepers:   
+- 340224808 (IAV)
+- 304017553 (IAV + likely another coronavirus)
+- 340239805 (Cov2)
+- 340233896 (Cov2)
+- 340239790 (Cov2)
+- 340239789 (Cov2)
+- 304012699 (Other -- likely another coronavirus)
+- 300312389 (other)
+- 304020362 (other)
+   
+```{r eval=FALSE}
+keepers = selection_data %>% 
+  dplyr::filter(sample %in% c(304020298, 340224808, 304017553, 340239805, 340233896,
+                              340239790, 340239789, 304012699, 300312389, 304020362)) %>% 
+  mutate(vol_for_250_pg = round(250 / RNA_concentration_pg_ul, digits = 3))
+keepers$dilution = ifelse(keepers$vol_for_250_pg > 0.5,
+                          yes = 1,
+                          no = ifelse(keepers$vol_for_250_pg > 0.1,
+                                      yes = 5,
+                                      no = 20))
+keepers$dilution_vol_for_250_pg = round(250 / (keepers$RNA_concentration_pg_ul / keepers$dilution), digits = 3)
+write.csv(keepers, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200612_resequencing_samples.csv")
+keepers
+```   
+   
+# Signatures associated with SARS-CoV-2   
+## Single genes   
+### IL6   
+```{r}
+il6_counts = plotCounts(mp_des, 
+           gene = "ENSG00000136244",
+           normalized = T,
+           intgroup = "covid_confirmed",
+           returnData = T) %>% 
+  rownames_to_column(var = "sample") %>% 
+  left_join(., 
+            metadata,
+            by = c("sample", "covid_confirmed"))
+
+cor.test(il6_counts$count, il6_counts$percent_total_CD206_high)
+il6_plot = ggplot(il6_counts, aes(x = percent_total_CD206_high, y = count, color = covid_confirmed)) +
+  geom_point(size = 3) +
+  scale_y_log10() +
+  ylab("IL6 Counts")
+```   
+Later confirmed NSD by group. Clearly correlates with MoAM character.        
+   
+### IL1b   
+```{r}
+il1b_counts = plotCounts(mp_des, 
+           gene = "ENSG00000125538",
+           normalized = T,
+           intgroup = "covid_confirmed",
+           returnData = T) %>% 
+  rownames_to_column(var = "sample") %>% 
+  left_join(., 
+            metadata,
+            by = c("sample", "covid_confirmed"))
+
+cor.test(il1b_counts$count, il1b_counts$percent_total_CD206_high)
+il1b_plot = ggplot(il1b_counts, aes(x = percent_total_CD206_high, y = count, color = covid_confirmed)) +
+  geom_point(size = 3) +
+  scale_y_log10() + 
+  ylab("IL1b Counts")
+
+il6_plot / il1b_plot
+```
+Later confirmed significantly downregulated, actually.   
+
+## Basic DEA   
+### Gene hits   
+   
+Versus healthy controls   
+```{r}
+cov2_vs_hc_results = as.data.frame(results(object = mp_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Healthy_Control"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_hc_results_ids = cov2_vs_hc_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id)) %>% 
+  arrange(log2FoldChange)
+
+write.csv(cov2_vs_hc_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200717_standard_DEA_covid_over_healthycontrols.csv")
+
+cov2_vs_hc_results_ids
+```   
+   
+Upregulation of CoV-2 genes is gorgeous
+   
+Versus non-pna (sick) controls
+```{r}
+cov2_vs_npc_results = as.data.frame(results(object = mp_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Non_Pneumonia_Control"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_npc_results_ids = cov2_vs_npc_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id)) %>% 
+  arrange(log2FoldChange)
+
+write.csv(cov2_vs_npc_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200717_standard_DEA_covid_over_nonpneumoniacontrols.csv")
+
+cov2_vs_npc_results_ids
+```
+   
+Versus other viral PNA
+```{r}
+cov2_vs_ovp_results = as.data.frame(results(object = mp_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Other_Viral_Pneumonia"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_ovp_results_ids = cov2_vs_ovp_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id)) %>% 
+  arrange(log2FoldChange)
+
+cov2_vs_ovp_results_ids
+
+write.csv(cov2_vs_ovp_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200717_standard_DEA_covid_over_otherviralpneumonia.csv")
+```   
+   
+Versus other PNA
+```{r}
+cov2_vs_other_pna_results = as.data.frame(results(object = mp_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Other_Pneumonia"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_other_pna_results_ids = cov2_vs_other_pna_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id)) %>% 
+  arrange(log2FoldChange)
+
+write.csv(cov2_vs_other_pna_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200717_standard_DEA_covid_over_otherpneumonia.csv")
+
+cov2_vs_other_pna_results_ids
+```  
+   
+### MA Plot   
+```{r eval=FALSE}
+pretty_MA_plot(cov2_vs_ovp_results, custom_annotation =  gene_conv)
+```
+
+   
+### Heatmap   
+   
+How many clusters does it take?   
+```{r}
+elbow = k_elbow(dge = mp_des, design = "~Diagnosis", 
+        cores = 12, 
+        minReps = Inf,
+        random_seed = 12345,
+        max_k = 25,
+        qval_cutoff = 0.01)
+elbow
+```   
+5 seems fair.   
+    
+```{r}
+intubation_pal = colorRampPalette(brewer.pal(n = 9, name = "Purples")[3:9])(max(mp_des$finite_day_of_intubation, na.rm = T) + 1)
+intubation_pal[1:3] = rep("#000000",3) #highlight "D0"
+
+cov2_kmeans_noclustering = k_means_figure(dge = mp_des,
+                                 design = "~Diagnosis",
+                                 k = 5,
+                                 go_annotations = "org.Hs.eg.db",
+                                 ensembl_db = "hsapiens_gene_ensembl",
+                                 legend_factors = c("Diagnosis", "finite_day_of_intubation"),
+                                 breaks = seq(-2, 2, length.out=101),
+                                 cores = 12,
+                             minReps = Inf,
+                             return_genes = T,
+                             display_go_terms = F,
+                             return_go_terms = T,
+                             cluster_columns = F,
+                             show_rownames = F,
+                             baseMeanCutoff = 20,
+                             random_seed = 12345,
+                             qval_cutoff = 0.05,
+                             annotation_colors = list(Diagnosis = c("Healthy_Control" = fig2_pal[6],
+                                                                    "Non_Pneumonia_Control" = fig2_pal[2],
+                                                                    "COVID_19" = fig2_pal[1], 
+                                                                    "Other_Viral_Pneumonia" = fig2_pal[3],
+                                                                    "Other_Pneumonia" = fig2_pal[4]),
+                                                      finite_day_of_intubation =  intubation_pal), 
+                             custom_order = c(3, 5, 1, 2, 4), 
+                             sortColumns = T,
+                             column_sort_factors = c("Diagnosis", "day0_sample"))
+
+cov2_kmeans_clustered = k_means_figure(dge = mp_des,
+                                 design = "~Diagnosis",
+                                 k = 5,
+                                 go_annotations = "org.Hs.eg.db",
+                                 ensembl_db = "hsapiens_gene_ensembl",
+                                 legend_factors = c("Diagnosis", "finite_day_of_intubation"),
+                                 breaks = seq(-2, 2, length.out=101),
+                                 cores = 12,
+                             minReps = Inf,
+                             return_genes = T,
+                             display_go_terms = F,
+                             return_go_terms = T,
+                             cluster_columns = T,
+                             show_rownames = F,
+                             baseMeanCutoff = 20,
+                             random_seed = 12345,
+                             qval_cutoff = 0.05,
+                             annotation_colors = list(Diagnosis = c("Healthy_Control" = fig2_pal[6],
+                                                                    "Non_Pneumonia_Control" = fig2_pal[2],
+                                                                    "COVID_19" = fig2_pal[1], 
+                                                                    "Other_Viral_Pneumonia" = fig2_pal[3],
+                                                                    "Other_Pneumonia" = fig2_pal[4]),
+                                                      finite_day_of_intubation =  intubation_pal), 
+                             custom_order = c(3, 5, 1, 2, 4))
+for(i in 1:length(cov2_kmeans_clustered$GO))
+{
+  cov2_kmeans_clustered$GO[[i]]$cluster = i
+}
+cov2_kmeans_clustered$go_df = bind_rows(cov2_kmeans_clustered$GO) %>% 
+  arrange(cluster, padj)
+saveRDS(cov2_kmeans_clustered, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_clustered.rds")
+write.csv(cov2_kmeans_clustered$genes, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_genes.csv")
+write.csv(cov2_kmeans_clustered$go_df, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_k_means_GO.csv")
+```   
+   
+This is actually very cool (and nicely foreshadows the later WGCNA results). C1: mostly COVID-related(!); highly enriched for type I interferon response (not production so much), as well as MHC-I. C2: mostly nonviral pneumonias. Pretty classic STAT3 inflammatory response. 
+   
+### D0 Heatmap   
+```{r eval=FALSE}
+d0_des = mp_des[, !is.na(mp_des$day_of_intubation) & mp_des$day_of_intubation <= 2 & mp_des$day_of_intubation >= 0]
+# cov2_d0_kmeans_noclustering = k_means_figure(dge = d0_des, 
+#                                  design = "~Diagnosis",
+#                                  k = 3,
+#                                  go_annotations = "org.Hs.eg.db",
+#                                  ensembl_db = "hsapiens_gene_ensembl",
+#                                  legend_factors = c("Diagnosis", "percent_total_CD206_high"),
+#                                  breaks = seq(-3, 3, length.out=101),
+#                                  cores = 12,
+#                              minReps = Inf,
+#                              return_genes = T,
+#                              display_go_terms = F,
+#                              return_go_terms = T,
+#                              cluster_columns = F,
+#                              label_fontsize = 2,
+#                              customAnno = gene_conv,
+#                              annoJoinCol = "ensembl_gene_id",
+#                              sortColumns = T,
+#                              colSortFactor = "Diagnosis",
+#                              baseMeanCutoff = 20)
+
+cov2_d0_kmeans_clustered = k_means_figure(dge = d0_des, 
+                                 design = "~Diagnosis",
+                                 k = 3,
+                                 go_annotations = "org.Hs.eg.db",
+                                 ensembl_db = "hsapiens_gene_ensembl",
+                                 legend_factors = c("Diagnosis", "percent_total_CD206_high"),
+                                 breaks = seq(-3, 3, length.out=101),
+                                 cores = 12,
+                             minReps = Inf,
+                             return_genes = T,
+                             display_go_terms = F,
+                             return_go_terms = T,
+                             cluster_columns = T,
+                             label_fontsize = 2,
+                             customAnno = gene_conv,
+                             annoJoinCol = "ensembl_gene_id",
+                             baseMeanCutoff = 20)
+```
+   
+## Individual genes   
+### CCL24   
+This was an interesting COVID-specific hit. According to published data, it is a highly selective chemoattractant for T cells. Would expect that it should correlate with T cell abundance.   
+   
+```{r}
+ccl24_counts = plotCounts(mp_des, 
+                          gene = "ENSG00000106178",
+                          intgroup = "Diagnosis",
+                       normalized = T,
+                       pc = T,
+                       returnData = T)
+ggplot(ccl24_counts, aes(x = Diagnosis, y = count, fill  = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non_Pneumonia_Control" = fig2_pal[2],
+                               "COVID_19" = fig2_pal[1],
+                               "Other_Viral_Pneumonia" = fig2_pal[3],
+                               "Other_Pneumonia" = fig2_pal[4])) +
+  scale_x_discrete(labels = c("Healthy_Control" = "Healthy\nControl",
+                               "Non_Pneumonia_Control" = "Non-Pneumonia\nControl",
+                               "COVID_19" = "COVID-19",
+                               "Other_Viral_Pneumonia" = "Other Viral\nPneumonia",
+                               "Other_Pneumonia" = "Other\nPneumonia")) +
+  xlab("") +
+  ylab("CCL24 Counts") +
+  theme_bw() +
+  theme(legend.position = "none", 
+        text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5))
+```
+
+   
+```{r}
+ccl24_cd4 = plotCounts(mp_des, 
+                          gene = "ENSG00000106178",
+                          intgroup = "percent_CD4_total",
+                       normalized = T,
+                       returnData = T) %>% 
+  rownames_to_column("sample")
+ccl24_cd8 = plotCounts(mp_des, 
+                          gene = "ENSG00000106178",
+                          intgroup = "percent_CD8_total",
+                       normalized = T,
+                       returnData = T) %>% 
+  rownames_to_column("sample")
+ccl24_tcells = left_join(ccl24_cd4, ccl24_cd8) %>% 
+  pivot_longer(names_to = "flow_parameter", 
+               values_to = "percent",
+               cols = c(percent_CD8_total, percent_CD4_total))
+
+ggplot(ccl24_tcells, aes(x = count, y = percent)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~flow_parameter) +
+  scale_x_log10()
+```
+Pretty poor correlation   
+   
+## IL-6   
+```{r}
+il6_counts = plotCounts(mp_des, 
+                          gene = "ENSG00000136244",
+                          intgroup = "Diagnosis",
+                       normalized = T,
+                       pc = T,
+                       returnData = T)
+ggplot(il6_counts, aes(x = Diagnosis, y = count, fill  = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non_Pneumonia_Control" = fig2_pal[2],
+                               "COVID_19" = fig2_pal[1],
+                               "Other_Viral_Pneumonia" = fig2_pal[3],
+                               "Other_Pneumonia" = fig2_pal[4])) +
+  scale_x_discrete(labels = c("Healthy_Control" = "Healthy\nControl",
+                               "Non_Pneumonia_Control" = "Non-Pneumonia\nControl",
+                               "COVID_19" = "COVID-19",
+                               "Other_Viral_Pneumonia" = "Other Viral\nPneumonia",
+                               "Other_Pneumonia" = "Other\nPneumonia")) +
+  xlab("") +
+  ylab("IL-6 Counts") +
+  theme_bw() +
+  theme(legend.position = "none", 
+        text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5))
+```
+
+## Sasha's picks   
+### All to start   
+```{r}
+sasha_genes = c("CCL20", "CCL24", "CCL3", "CCL8", "CCR2", "CCL2", "IL1A", "IL1B", "AREG", 
+                "CXCR4", "TNFSF14", "CXCL3", "CXCL5", "CXCL1", "CXCL8", "ATF4", "CD164", 
+                "MFGE8", "IL13RA1", "IL1RL1", "IL18R1", "VSIG4", "VEGFA", "DDIT4", "BAG3", 
+                "DNAJB1", "HSP90AA6P", "HSPA1B", "HSPA1A")
+sasha_genes = subset(gene_conv, gene_name %in% sasha_genes)
+
+sasha_counts = mclapply(sasha_genes$ensembl_gene_id, function(x){
+  counts = plotCounts(mp_des,
+                      gene = x,
+                      intgroup = "Diagnosis",
+                      returnData = T,
+                      normalized = T,
+                      pc = T)
+  counts$gene = x
+  return(counts)})
+sasha_counts = bind_rows(sasha_counts) %>% 
+  left_join(., sasha_genes, by = c("gene" = "ensembl_gene_id"))
+
+sasha_gene_plot = ggplot(sasha_counts, aes(x = Diagnosis, y = count, fill = Diagnosis)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(size = 0.1, width = 0.25) +
+  scale_y_continuous(trans = "log10") +
+  scale_fill_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non_Pneumonia_Control" = fig2_pal[2],
+                               "COVID_19" = fig2_pal[1],
+                               "Other_Viral_Pneumonia" = fig2_pal[3],
+                               "Other_Pneumonia" = fig2_pal[4])) +
+  scale_x_discrete(labels = c("Healthy_Control" = "Healthy\nControl",
+                               "Non_Pneumonia_Control" = "Non-Pneumonia\nControl",
+                               "COVID_19" = "COVID-19",
+                               "Other_Viral_Pneumonia" = "Other Viral\nPneumonia",
+                               "Other_Pneumonia" = "Other\nPneumonia")) +
+  xlab("") +
+  ylab("Gene Counts") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  facet_wrap(~gene_name)
+sasha_gene_plot
+```
+
+   
+# Compare with sort data   
+## Subset to samples with sorting data   
+```{r}
+sorted = mp[, !is.na(mp$percent_total_CD206_high)]
+design(sorted) = ~Diagnosis + percent_total_CD206_high
+```   
+   
+## Determine best dispersion estimates   
+### Parametric   
+```{r}
+sorted_des_parametric = DESeq(sorted, 
+                          fitType = "parametric",
+                          parallel = T) #no outliers in this case
+plotDispEsts(sorted_des_parametric)
+```   
+Actually very decent      
+    
+### Local
+```{r}
+sorted_des_local = DESeq(sorted, 
+                          fitType = "local",
+                          parallel = T)
+plotDispEsts(sorted_des_local)
+sorted_des = sorted_des_local 
+rm(sorted_des_local, sorted_des_parametric)
+```  
+Both have their issues but this at least does not throw out low-expression genes for having infinite dispersion.   
+   
+## PCA   
+```{r}
+pca_data = plotPCA(vst(sorted),
+                   intgroup = c("covid_confirmed"),
+                   returnData = T)
+pca_data = left_join(pca_data,
+                     as.data.frame(colData(mp)),
+                     by = c("name" = "sample", "covid_confirmed"))
+ggplot(pca_data, aes(x = PC1, y = PC2, shape = covid_confirmed, color = percent_total_CD206_high)) +
+  geom_point(size = 2)
+```
+   
+## Clustering   
+### All samples   
+```{r}
+detection_rate = function(x)
+{
+  return(sum(x > 0) / length(x)) 
+}
+
+all_counts = counts(mp_des, normalized = T)
+#get 500 most variable genes with > 10% detection
+rv = rowVars(all_counts)
+prop_detected = apply(X = all_counts, MARGIN = 1, FUN = detection_rate)
+selection_criteria = data.frame(sample = rownames(all_counts), var = rv, prop_detected = prop_detected) %>% 
+  filter(prop_detected >= 0.1 & var > 0) %>% 
+  arrange(desc(var))
+top_genes = as.character(selection_criteria$sample[1:1000])
+top_all_counts = all_counts[top_genes, ]
+
+annotation = colData(mp_des) %>% 
+  as.data.frame() %>% 
+  dplyr::select(covid_confirmed, 
+                sars_cov2_detected,
+                sex,
+                #day_of_intubation,
+                infection_type,
+                percent_neutrophils,
+                percent_total_CD206_high)
+gene_annotation = gene_conv %>% 
+  dplyr::filter(ensembl_gene_id %in% rownames(top_all_counts)) %>% 
+  column_to_rownames(var = "ensembl_gene_id")
+
+pheatmap(top_all_counts,
+         cluster_rows = T,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation,
+         labels_row = gene_annotation$gene_name,
+         scale = "row",
+         show_rownames = T,
+         fontsize_row = 2,
+         show_colnames = F,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         angle_col = 45)
+```
+
+### Day 0   
+```{r}
+day0_samples = which(mp$day_of_intubation <= 2)
+day0 = mp_des[, day0_samples]
+day0_counts = counts(day0, normalized = T)
+
+#get 1000 most variable genes
+rv = rowVars(day0_counts)
+prop_detected = apply(X = day0_counts, MARGIN = 1, FUN = detection_rate)
+selection_criteria = data.frame(sample = rownames(day0_counts), var = rv, prop_detected = prop_detected) %>% 
+  filter(prop_detected >= 0.1 & var > 0) %>% 
+  arrange(desc(var))
+top_genes = as.character(selection_criteria$sample[1:1000])
+top_day0_counts = day0_counts[top_genes, ]
+
+annotation = colData(day0) %>% 
+  as.data.frame() %>% 
+  dplyr::select(covid_confirmed, 
+                sars_cov2_detected,
+                gender,
+                infection_type,
+                percent_neutrophils,
+                percent_total_CD206_high)
+gene_annotation = gene_conv %>% 
+  dplyr::filter(ensembl_gene_id %in% rownames(top_day0_counts)) %>% 
+  column_to_rownames(var = "ensembl_gene_id")
+
+pheatmap(top_day0_counts,
+         cluster_rows = T,
+         cluster_cols = T,
+         clustering_method = "ward.D2",
+         annotation_col = annotation,
+         labels_row = gene_annotation$gene_name,
+         scale = "row",
+         show_rownames = T,
+         show_colnames = F,
+         fontsize_row = 2,
+         breaks = seq(-3, 3, length.out=101),
+         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100),
+         angle_col = 45)
+```
+
+   
+## DEA   
+Versus controls
+```{r}
+cov2_vs_npc_results = as.data.frame(results(object = sorted_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Non_Pneumonia_Control"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_npc_results_ids = cov2_vs_npc_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
+
+write.csv(cov2_vs_npc_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_covid_over_nonpneumoniacontrols.csv")
+
+cov2_vs_npc_results_ids
+```
+   
+Versus other viral PNA
+```{r}
+cov2_vs_ovp_results = as.data.frame(results(object = sorted_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Other_Viral_Pneumonia"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_ovp_results_ids = cov2_vs_ovp_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
+
+write.csv(cov2_vs_ovp_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_covid_over_otherviralpneumonia.csv")
+
+cov2_vs_npc_results_ids
+```   
+   
+```{r}
+cov2_vs_other_pna_results = as.data.frame(results(object = sorted_des,
+                                  contrast = c("Diagnosis", "COVID_19", "Other_Pneumonia"),
+                                  alpha = 0.05,
+                                  parallel = T))
+
+cov2_vs_other_pna_results_ids = cov2_vs_other_pna_results %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
+
+write.csv(cov2_vs_other_pna_results_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_covid_over_otherpneumonia.csv")
+
+cov2_vs_other_pna_results_ids
+```   
+Unsurprisingly, there are very few valid differences here
+   
+### MoAM percentage   
+```{r}
+MoAM_results_sorted = results(sorted_des, 
+                               name = c("percent_total_CD206_high")) %>% 
+  as.data.frame()
+
+MoAM_results_sorted_ids = MoAM_results_sorted %>% 
+  rownames_to_column("ensembl_gene_id") %>% 
+  left_join(., gene_conv) %>% 
+  dplyr::filter(padj < 0.05 | !grepl("ENSG", ensembl_gene_id))
+
+write.csv(MoAM_results_sorted_ids, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200702_sorted_DEA_percent_CD206_high.csv")
+
+MoAM_results_sorted_ids
+pretty_MA_plot(MoAM_results_sorted, mart_name = "hsapiens_gene_ensembl")
+```
+This looks quite resasuring. CD206 hi samples have elevated expression of FABP4, anticorrelates with SPP1, CXCL8.       
+   
+### What can be explained by MoAM% alone?   
+TMPRSS2
+```{r}
+d = plotCounts(sorted_des, 
+               gene = "ENSG00000184012",
+               intgroup = "percent_total_CD206_high",
+               normalized = T,
+               returnData = T)
+ggplot(d, aes(x = percent_total_CD206_high, y = count)) +
+  geom_point() +
+  ylab("MRC1 (CD206) Counts")
+```
+
+## Comparing different pathogens   
+### Individual pathogens   
+```{r eval=FALSE}
+pathogen_set = mp_des[, !is.na(mp$pathogen)]
+pathogen_set$pathogen = factor(as.character(pathogen_set$pathogen)) #refactor
+pathogen_kmeans = k_means_figure(dge = pathogen_set, 
+                                 design = "~pathogen",
+                                 k = 6,
+                                 go_annotations = "org.Hs.eg.db",
+                                 ensembl_db = "hsapiens_gene_ensembl",
+                                 legend_factors = c("pathogen", "covid_confirmed"),
+                                 breaks = seq(-3, 3, length.out=101),
+                                 cores = 12)
+```
+Probably too granular   
+   
+### Broad groupings  
+```{r eval=FALSE}
+infection_type_kmeans = k_means_figure(dge = pathogen_set, 
+                                 design = "~infection_type",
+                                 k = 4,
+                                 go_annotations = "org.Hs.eg.db",
+                                 ensembl_db = "hsapiens_gene_ensembl",
+                                 legend_factors = c("pathogen", "infection_type"),
+                                 breaks = seq(-3, 3, length.out=101),
+                                 cores = 12)
+```
+
+# Random   
+## ACE2 counts   
+```{r}
+ace2_counts = plotCounts(mp_des, 
+                         gene = "ENSG00000130234", 
+                         intgroup = "covid_confirmed",
+                         returnData = T,
+                         normalized = T, 
+                         pc = F)
+ggplot(ace2_counts, aes(x = count)) +
+  geom_histogram(fill = "dodgerblue4", ) +
+  ylab("Number of Samples") +
+  xlab("ACE2 Count")
+```   
+   
+# Trajectories?   
+## All samples   
+We will use PCA as is recommended to make computation feasible.      
+```{r}
+#select genes with > 10% detection, mean counts > 5
+all_counts = t(counts(mp_des, normalized = T)) #need size normalization
+prop_detected = apply(X = all_counts, MARGIN = 2, FUN = detection_rate)
+all_counts = all_counts[, prop_detected > 0.1]
+mean_detection = colMeans(all_counts)
+all_counts = all_counts[, mean_detection >= 5]
+
+all_pca = prcomp(all_counts)
+fviz_eig(all_pca, 
+         barfill = "dodgerblue4", 
+         xlab = "Principal Component",
+         ylab = "Percent Variance Explained", 
+         main = "",
+         ncp = 50,
+         ggtheme = theme_bw(),
+         addlabels = T) #20 should capture almost everything
+
+total_umap = umap(X = all_counts, 
+                  pca = 20, 
+                  pca_center = T, 
+                  n_threads = 1, 
+                  scale = "Z", 
+                  min_dist = 0.2)
+rownames(total_umap) = rownames(all_counts)
+colnames(total_umap) = c("UMAP_1", "UMAP_2")
+total_umap = as.data.frame(total_umap)
+total_umap$sample = rownames(total_umap)
+total_umap = left_join(total_umap, metadata, by = "sample") %>% 
+  arrange(study_id, day_of_intubation) # so we can draw paths
+
+ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, color = Diagnosis)) +
+  geom_point() +
+  stat_ellipse()
+
+ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, shape = study_id, color = day_of_intubation)) +
+  geom_path(arrow = grid::arrow()) +
+  scale_color_viridis() +
+  facet_wrap(~ Diagnosis)
+```   
+Patients actually separate out really well here. This might be worth including as a supplement. With that said, probably better to just use COVID patients for "trajectories". It looks like there may be some structure to the COVID data.      
+   
+
+## Only COVID   
+```{r}
+#remove non-detected genes
+#note that PCA should only use genes detected in all samples (3081)
+COVID_counts = t(counts(mp_des[, mp_des$Diagnosis == "COVID_19"], normalized = T)) #need size normalization
+prop_detected = apply(X = COVID_counts, MARGIN = 2, FUN = detection_rate)
+COVID_counts = COVID_counts[, prop_detected > 0.1]
+mean_detection = colMeans(COVID_counts)
+COVID_counts = COVID_counts[, mean_detection >= 5]
+
+COVID_pca = prcomp(COVID_counts)
+fviz_eig(COVID_pca, 
+         barfill = "dodgerblue4", 
+         xlab = "Principal Component",
+         ylab = "Percent Variance Explained", 
+         main = "",
+         ncp = 50,
+         ggtheme = theme_bw(),
+         addlabels = T) #20 should capture almost everything
+
+COVID_umap = umap(X = COVID_counts, 
+                  pca = 20, 
+                  pca_center = T, 
+                  n_threads = 1, 
+                  scale = "Z", 
+                  min_dist = 0.4)
+rownames(COVID_umap) = rownames(COVID_counts)
+colnames(COVID_umap) = c("UMAP_1", "UMAP_2")
+COVID_umap = as.data.frame(COVID_umap)
+COVID_umap$sample = rownames(COVID_umap)
+COVID_umap = left_join(COVID_umap, metadata, by = "sample") %>% 
+  arrange(study_id, day_of_intubation) # so we can draw paths
+
+ggplot(COVID_umap, aes(x = UMAP_1, y = UMAP_2, color = day_of_intubation)) +
+  scale_color_viridis() +
+  geom_point()
+ggplot(COVID_umap, aes(x = UMAP_1, y = UMAP_2, shape = study_id, color = day_of_intubation)) +
+  scale_color_viridis() +
+  geom_path(arrow = grid::arrow())
+```   
+Not so much structure it seems.   
+
+# WGCNA   
+What gene modules are associated with covid? Which change substantially over time on ventilator?   
+## Thesholding
+```{r}
+#setup
+enableWGCNAThreads(nThreads = 12)
+WGCNAnThreads()
+
+# Choose a set of soft-thresholding powers
+powers = c(1:20)
+
+# Call the network topology analysis functions
+sft = pickSoftThreshold(all_counts, powerVector = powers, verbose = 5, networkType = "signed")
+
+# Plot the results:
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2))
+cex1 = 0.9
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], 
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit,signed R^2",
+     type="n",
+     main = paste("Scale independence"))
+text(sft$fitIndices[,1], 
+     -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,
+     cex=cex1,
+     col="red")
+
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.90,col="red")
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], 
+     sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",
+     ylab="Mean Connectivity", 
+     type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+```   
+7 looks like the intersection after adding healthy controls   
+   
+## Co-expression by similarity and adjacency   
+```{r}
+softPower = 7
+adjacency = adjacency(all_counts, power = softPower, type = "signed")
+```
+
+## Topological overlap matrix   
+```{r}
+# Turn adjacency into topological overlap
+TOM = TOMsimilarity(adjacency, TOMType = "signed")
+dissTOM = 1-TOM
+```
+
+## Cluster by TOM distance   
+```{r}
+geneTree = hclust(as.dist(dissTOM), method = "average")
+
+sizeGrWindow(12,9)
+plot(geneTree, 
+     xlab="", 
+     sub="", 
+     main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, 
+     hang = 0.04)
+```   
+   
+## Create modules   
+```{r}
+minModuleSize = 30 # may need to adjust
+
+# Make modules based on clusters
+dynamicMods = cutreeDynamic(dendro = geneTree, 
+                            distM = dissTOM,
+                            deepSplit = 2,
+                            pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+table(dynamicMods)
+```   
+   
+### Label modules (yeah this is dumb -- rename later)   
+```{r}
+# Convert numeric labels into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, 
+                    dynamicColors, 
+                    "Dynamic Tree Cut",
+                    dendroLabels = FALSE,
+                    hang = 0.03,
+                    addGuide = TRUE,
+                    guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+```   
+Looks like we captured the structure pretty well.      
+   
+### Merge similar modules   
+```{r}
+# Calculate eigengenes
+MEList = moduleEigengenes(all_counts, 
+                          colors = dynamicColors)
+MEs = MEList$eigengenes
+
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs)
+
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), 
+                method = "average")
+
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, 
+     main = "Clustering of module eigengenes",
+     xlab = "",
+     sub = "")
+
+#Now cut at height of 0.5 to get correlation of 0.5  
+#standard is 0.25, but we have some really similar modules that are not relevant
+MEDissThres = 0.25
+
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, 
+       col = "red")
+
+# Call an automatic merging function
+merge = mergeCloseModules(all_counts, 
+                          dynamicColors, 
+                          cutHeight = MEDissThres, 
+                          verbose = 3)
+
+# The merged module colors
+mergedColors = merge$colors
+
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs
+
+# Rename to moduleColors
+moduleColors = mergedColors
+
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+
+#replot
+sizeGrWindow(12, 9)
+plotDendroAndColors(geneTree, 
+                    cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, 
+                    hang = 0.03,
+                    addGuide = TRUE, 
+                    guideHang = 0.05)
+```   
+No change   
+   
+## Relate back to traits   
+### Without vent settings   
+```{r}
+# Define numbers of genes and samples
+nGenes = ncol(all_counts)
+nSamples = nrow(all_counts)
+metadata = as.data.frame(colData(mp_des))
+md_of_interest = metadata %>% 
+  mutate(deceased = ifelse(binned_outcome == "Deceased",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(has_covid = ifelse(covid_confirmed == "TRUE",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(cov2_detected = ifelse(sars_cov2_detected == TRUE,
+                                yes = 1,
+                                no = 0)) %>% 
+  mutate(has_pneumonia = ifelse(pna_type == "Non-Pneumonia Control",
+                           yes = 0,
+                           no = 1)) %>% 
+  mutate(coinfection_detected = ifelse(any_nonviral == "TRUE",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(other_viral_pna = ifelse(pna_type == "Other Viral Pneumonia",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(nonviral_pna = ifelse(pna_type == "Other Pneumonia",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(is_healthy_control = ifelse(pna_type == "Healthy Control",
+                           yes = 1,
+                           no = 0)) %>% 
+  dplyr::select(deceased, has_covid, cov2_detected, has_pneumonia,
+                other_viral_pna, nonviral_pna, is_healthy_control,
+                percent_neutrophils, percent_total_CD206_high,
+                percent_CD4_total, percent_CD8_total, finite_day_of_intubation,
+                C_Reactive_Protein, D_DIMER, PROCALCITONIN, mean_aps)
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(all_counts, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = bicor(MEs, 
+                     md_of_interest, 
+                     use = "pairwise.complete.obs",
+                     maxPOutliers = 0.05)
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, 
+                                     nSamples) %>% 
+  as.numeric() %>% 
+  p.adjust(., method = "fdr") %>% 
+  matrix(ncol = ncol(moduleTraitCor))
+colnames(moduleTraitPvalue) = colnames(moduleTraitCor)
+rownames(moduleTraitPvalue) = rownames(moduleTraitCor)
+moduleTraitCor_hm = t(moduleTraitCor)
+#just make significant or not
+pvals_hm = t(moduleTraitPvalue) %>% 
+  as.matrix()
+pvals_hm[pvals_hm < 0.05] = ""
+pvals_hm[pvals_hm != ""] = "NS"
+
+labs = c("Deceased", "COVID-19", "SARS-CoV-2 Detected", "Any Pneumonia", "Other Viral Pneumonia", "Other Pneumonia",
+         "Healthy Control", "% Neutrophils", "% Macrophages CD206-high", "% CD4 T", "% CD8 T",
+         "Day of Intubation", "CRP", "D-Dimer", "Procalcitonin", "Mean APS")
+module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
+                              labels_row = labs,
+                              labels_col = paste("Module", c(1:ncol(MEs))),
+                              display_numbers = pvals_hm,
+                              cluster_rows = T,
+                              cluster_cols = T,
+                              clustering_method = "ward.D2",
+                              color = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                          name = "RdBu")))(100),
+                              angle_col = 315)
+module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
+                              labels_row = labs,
+                              labels_col = paste("Module", c(1:ncol(MEs))),
+                              display_numbers = pvals_hm,
+                              cluster_rows = T,
+                              cluster_cols = T,
+                              clustering_method = "ward.D2",
+                              color = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                          name = "RdBu")))(100),
+                              angle_col = 315, 
+                              fontsize_row = 32,
+                              fontsize = 24)
+```
+Module 12 (turquoise) looks like the key MoAM cluster, 4 (blue) is key TRAM, and module 14 (purple) is likely our IFN cluster.
+
+### With vent settings   
+```{r}
+# Define numbers of genes and samples
+nGenes = ncol(all_counts)
+nSamples = nrow(all_counts)
+
+md_of_interest = metadata %>% 
+  mutate(deceased = ifelse(binned_outcome == "Deceased",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(has_covid = ifelse(covid_confirmed == "TRUE",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(cov2_detected = ifelse(sars_cov2_detected == TRUE,
+                                yes = 1,
+                                no = 0)) %>% 
+  mutate(has_pneumonia = ifelse(pna_type == "Non-Pneumonia Control",
+                           yes = 0,
+                           no = 1)) %>% 
+  mutate(coinfection_detected = ifelse(any_nonviral == "TRUE",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(other_viral_pna = ifelse(pna_type == "Other Viral Pneumonia",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(nonviral_pna = ifelse(pna_type == "Other Pneumonia",
+                           yes = 1,
+                           no = 0)) %>% 
+  mutate(is_healthy_control = ifelse(pna_type == "Healthy Control",
+                           yes = 1,
+                           no = 0)) %>% 
+  dplyr::select(deceased, has_covid, cov2_detected, has_pneumonia,
+                other_viral_pna, nonviral_pna, is_healthy_control,
+                percent_neutrophils, percent_total_CD206_high,
+                percent_CD4_total, percent_CD8_total, finite_day_of_intubation,
+                C_Reactive_Protein, D_DIMER, PROCALCITONIN, mean_aps,
+                Static_Compliance, PF_ratio)
+
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(all_counts, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = bicor(MEs, 
+                     md_of_interest, 
+                     use = "pairwise.complete.obs",
+                     maxPOutliers = 0.05)
+
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, 
+                                     nSamples) %>% 
+  as.numeric() %>% 
+  p.adjust(., method = "fdr") %>% 
+  matrix(ncol = ncol(moduleTraitCor))
+colnames(moduleTraitPvalue) = colnames(moduleTraitCor)
+rownames(moduleTraitPvalue) = rownames(moduleTraitCor)
+
+moduleTraitCor_hm = t(moduleTraitCor)
+#just make significant or not
+pvals_hm = t(moduleTraitPvalue) %>% 
+  as.matrix()
+pvals_hm[pvals_hm < 0.05] = ""
+pvals_hm[pvals_hm != ""] = "NS"
+
+
+labs = c("Deceased", "COVID-19", "SARS-CoV-2 Detected", "Any Pneumonia", "Other Viral Pneumonia", "Other Pneumonia",
+         "Healthy Control", "% Neutrophils", "% Macrophages CD206-high", "% CD4 T", "% CD8 T",
+         "Day of Intubation", "CRP", "D-Dimer", "Procalcitonin", "Mean APS",
+         "Static Compliance", "P/F Ratio")
+module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
+                              labels_row = labs,
+                              labels_col = paste("Module", c(1:ncol(MEs))),
+                              display_numbers = pvals_hm,
+                              cluster_rows = T,
+                              cluster_cols = T,
+                              clustering_method = "ward.D2",
+                              color = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                          name = "RdBu")))(100),
+                              angle_col = 315)
+module_cor_heatmap = pheatmap(mat = moduleTraitCor_hm,
+                              labels_row = labs,
+                              labels_col = paste("Module", c(1:ncol(MEs))),
+                              display_numbers = pvals_hm,
+                              cluster_rows = T,
+                              cluster_cols = T,
+                              clustering_method = "ward.D2",
+                              color = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                          name = "RdBu")))(100),
+                              angle_col = 315, 
+                              fontsize_row = 32,
+                              fontsize = 24)
+```   
+Module 13 (salmon) may also be interesting. Correlates with COVID, CRP, lymphocytes, and vent params!    
+   
+### Sanity check: are the CD206 modules TRAM/MoAM markers?   
+```{r}
+module_assignments = data.frame(ensembl_gene_id = colnames(all_counts),
+                                module = factor(mergedColors)) %>% 
+  left_join(., gene_conv)
+write.csv(module_assignments,
+          "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_WGCNA_module_assignments.csv")
+
+cd206_correlated = subset(module_assignments, module == "blue")
+cd206_anticorrelated = subset(module_assignments, module == "turquoise")
+cd206_correlated
+cd206_anticorrelated
+```
+Pretty ideal, yeah   
+   
+   
+### COVID-associated   
+Purple contains all of the CoV-2 genes!   
+```{r}
+covid_correlated_cd206_uncorrelated = subset(module_assignments, module == "purple")
+covid_correlated_cd206_uncorrelated
+write.csv(covid_correlated_cd206_uncorrelated,
+          "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_purple_module_14_genes.csv")
+```
+Pretty classic interferon response. Look at the GO.   
+   
+```{r}
+#from k_means_figure
+complete_counts = counts(mp_des, normalized = T)
+universe = rownames(complete_counts[rowSums(complete_counts) > 0, ])
+fisherTest = new("classicCount", testStatistic = GOFisherTest, name = "Fisher test")
+
+cluster_genes = covid_correlated_cd206_uncorrelated$ensembl_gene_id
+selection = as.numeric(universe %in% cluster_genes)
+names(selection) = universe
+go_data = new("topGOdata", 
+              ontology = "BP", 
+              allGenes = selection,
+              geneSel = function(x){
+                return(x == 1)},
+              annot = annFUN.org, 
+              mapping = "org.Hs.eg.db", 
+              ID = "ensembl")
+  
+#run Fisher test
+test_results = getSigGroups(go_data, fisherTest)
+module14_score = as.data.frame(score(test_results))
+colnames(module14_score) = "pval"
+module14_score = rownames_to_column(module14_score, var = "go_id")
+  
+#adjust p-values and take significant
+module14_score$padj = p.adjust(module14_score$pval, method = "fdr")
+module14_score = subset(module14_score, padj < 0.05)
+module14_score$description = NA
+for(i in 1:nrow(module14_score))
+{
+  module14_score$description[i] = GOTERM[[module14_score$go_id[i]]]@Term
+}
+
+#add descriptions
+module14_score$full_go = paste(module14_score$go_id, module14_score$description)
+write.csv(module14_score,
+          "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_purple_module_14_GO.csv")
+module14_score
+```
+Pretty much all Type I interferon related. Most of the paper is here.   
+   
+### Module 13   
+This module has IRF1 and the MHC-I genes   
+```{r}
+module13 = subset(module_assignments, module == "salmon")
+module13
+write.csv(module13,
+          "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_salmon_module_13_genes.csv")
+```
+   
+```{r}
+#from k_means_figure
+cluster_genes = module13$ensembl_gene_id
+selection = as.numeric(universe %in% cluster_genes)
+names(selection) = universe
+go_data = new("topGOdata", 
+              ontology = "BP", 
+              allGenes = selection,
+              geneSel = function(x){
+                return(x == 1)},
+              annot = annFUN.org, 
+              mapping = "org.Hs.eg.db", 
+              ID = "ensembl")
+  
+#run Fisher test
+test_results = getSigGroups(go_data, fisherTest)
+module13_score = as.data.frame(score(test_results))
+colnames(module13_score) = "pval"
+module13_score = rownames_to_column(module13_score, var = "go_id")
+  
+#adjust p-values and take significant
+module13_score$padj = p.adjust(module13_score$pval, method = "fdr")
+module13_score = subset(module13_score, padj < 0.05)
+# module13_score$description = NA
+# for(i in 1:nrow(module13_score))
+# {
+#   module13_score$description[i] = GOTERM[[module13_score$go_id[i]]]@Term
+# }
+# 
+# #add descriptions
+# module13_score$full_go = paste(module13_score$go_id, module13_score$description)
+# write.csv(module13_score,
+#           "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_salmon_module_13_GO.csv")
+# module13_score
+```
+No significant hits.   
+   
+## Plot interesting modules   
+### Purple module (14) and diagnosis, outcome   
+```{r}
+total_umap = MEList$averageExpr %>% 
+  rownames_to_column("sample") %>% 
+  left_join(total_umap, .)
+covid_umap = total_umap %>% 
+  dplyr::filter(covid_confirmed == TRUE)
+
+ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEpurple, color = Diagnosis)) +
+  geom_point()
+module14_umap = ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEpurple, color = pna_type, shape = binned_outcome)) +
+  geom_point() +
+  theme_bw() +
+  theme(text = element_text(size = 16, family = "Arial"),
+        legend.text = element_text(size = 16, family = "Arial"),
+        legend.title = element_text(size = 16, family = "Arial")) +
+  scale_color_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4]),
+                    na.value = "black") +
+  scale_shape_manual(name = "",
+                    values = c("Deceased" = 13,
+                               "Discharged" = 19,
+                               "Inpatient Facility" = 18,
+                               "Other" = 18),
+                               na.value = 1) +
+  scale_size_continuous(name = "Module 14 Expression", 
+                        range = c(1, 10)) +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+module14_umap 
+```   
+   
+### CCL24      
+```{r}
+ccl24_counts = rownames_to_column(ccl24_counts, var = "sample")
+ccl24_counts = ccl24_counts[, 1:2]
+colnames(ccl24_counts)[2] = "CCL24"
+total_umap = left_join(total_umap, ccl24_counts)
+ccl24_umap = ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = CCL24, color = pna_type, shape = binned_outcome)) +
+  geom_point() +
+  theme_bw() +
+  theme(text = element_text(size = 16, family = "Arial"),
+        legend.text = element_text(size = 16, family = "Arial"),
+        legend.title = element_text(size = 16, family = "Arial")) +
+  scale_color_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4]),
+                    na.value = "black") +
+  scale_shape_manual(name = "",
+                    values = c("Deceased" = 13,
+                               "Discharged" = 19,
+                               "Inpatient Facility" = 18,
+                               "Other" = 18),
+                               na.value = 1) +
+scale_size_continuous(name = "CCL24 Counts", trans = "log10", range = c(1, 10)) +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+ccl24_umap 
+```
+This is really cool! This isolates most the the IFN-non-responsive COVID patients. Maybe this drives heterogeneity in celltype composition in the lung?   
+   
+```{r}
+tcell_umap = ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = percent_CD3_total, color = pna_type, shape = binned_outcome)) +
+  geom_point() +
+  theme_bw() +
+  theme(text = element_text(size = 16, family = "Arial"),
+        legend.text = element_text(size = 16, family = "Arial"),
+        legend.title = element_text(size = 16, family = "Arial")) +
+  scale_color_manual(name = "",
+                    values = c("Healthy_Control" = fig2_pal[6],
+                               "Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1],
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4]),
+                    na.value = "black") +
+  scale_shape_manual(name = "",
+                    values = c("Deceased" = 13,
+                               "Discharged" = 19,
+                               "Inpatient Facility" = 18,
+                               "Other" = 18),
+                               na.value = 1) +
+scale_size_continuous(name = "Percent Lymphocytes", range = c(1, 10)) +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+
+tcell_umap 
+```
+
+
+   
+### Brown/turquoise modules and day of intubation in COVID patients   
+TRAM content   
+```{r}
+ggplot(total_umap, aes(x = day_of_intubation, y = AEblue)) +
+  geom_point() +
+  geom_smooth()
+
+ggplot(total_umap, aes(x = day_of_intubation, y = AEturquoise)) +
+  geom_point() +
+  geom_smooth()
+```
+Not much of a correlation...maybe a flat line, as I guess would be expected with near-constant recruitment. 
+   
+## Effect of ORF8 expression   
+### Isolate counts   
+```{r}
+orf8 = cov2_genes$ensembl_gene_id[which(cov2_genes$gene_name == "ORF8")]
+orf8_counts = plotCounts(mp_des, 
+                         gene = orf8, 
+                         intgroup = "pna_type",
+                         returnData = T,
+                         normalized = T, 
+                         pc = T)
+orf8_samples = rownames(subset(orf8_counts, count >0))
+
+ggplot(orf8_counts, aes(x = pna_type, y = count)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = count > 0)) +
+  scale_y_log10() +
+  ylab("ORF8 Counts") +
+  xlab("") 
+```   
+   
+Not a ton of detection but very clean.   
+   
+### Association with interferon responses   
+```{r}
+mp_des$orf8_detected = mp_des$sample %in% orf8_samples
+total_umap$orf8_detected = total_umap$sample %in% orf8_samples
+ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = MEpurple, color = Diagnosis, shape = orf8_detected)) +
+  geom_point()
+```  
+Pretty clear spatial correlation...but in the opposite direction?   
+   
+```{r}
+ggplot(total_umap, aes(x = orf8_detected, y = MEpurple)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = Diagnosis))
+
+high_cov2 = colnames(cov2_counts)[colSums(cov2_counts) > 50]
+total_umap$cov2_detected = total_umap$sample %in% high_cov2
+ggplot(total_umap, aes(x = cov2_detected, y = MEpurple)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = Diagnosis))
+```
+This really just correlates with overall viral load (which correlates, in turn, with ORF8 levels). No support really for the ORF8 inhibition of the IFN response, at least at this stage.   
+   
+# Interferon response over time   
+## WGCNA Module purple   
+### Average expression   
+```{r}
+ggplot(covid_umap, aes(x = finite_day_of_intubation, y = AEpurple)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+   
+## GO Categories   
+### Pull from biomart   
+```{r}
+human_mart = useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl", GRCh = 37)
+
+#now pull down genes based on gene ontology (GO) definitions
+typeI_IFN_response = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                           filters = "go",
+                           values = "GO:0060337",
+                           mart = human_mart)
+
+IFNg_response = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                           filters = "go",
+                           values = "GO:0060333",
+                           mart = human_mart)
+```   
+   
+### Assign mean expression   
+```{r}
+unfiltered_counts = counts(mp_des, normalized = T)
+typeI_IFN_response = subset(typeI_IFN_response, ensembl_gene_id %in% rownames(unfiltered_counts))
+IFNg_response = subset(IFNg_response, ensembl_gene_id %in% rownames(unfiltered_counts))
+type1_counts = unfiltered_counts[typeI_IFN_response$ensembl_gene_id, mp_des$covid_confirmed == TRUE]
+type1_counts = as.data.frame(colMeans(type1_counts)) %>% 
+  rownames_to_column("sample")
+colnames(type1_counts)[2] = "typeI_IFN_response"
+type2_counts = unfiltered_counts[IFNg_response$ensembl_gene_id, mp_des$covid_confirmed == TRUE]
+type2_counts = as.data.frame(colMeans(type2_counts)) %>% 
+  rownames_to_column("sample")
+colnames(type2_counts)[2] = "IFNg_response"
+ifn_counts = unfiltered_counts[intersect(IFNg_response$ensembl_gene_id, typeI_IFN_response$ensembl_gene_id),
+                               mp_des$covid_confirmed == TRUE]
+ifn_counts = as.data.frame(colMeans(ifn_counts)) %>% 
+  rownames_to_column("sample")
+colnames(ifn_counts)[2] = "general_IFN_response"
+
+covid_umap = covid_umap %>% 
+  dplyr::select(-c(typeI_IFN_response, IFNg_response, general_IFN_response)) %>% 
+  left_join(., type1_counts) %>% 
+  left_join(., type2_counts) %>% 
+  left_join(., ifn_counts)
+```
+   
+### Plot   
+```{r}
+ggplot(covid_umap, aes(x = finite_day_of_intubation, y = typeI_IFN_response)) +
+  geom_point() + 
+  geom_smooth(method = "lm", color = fig2_pal[2]) +
+  theme_bw() +
+  theme(legend.position = "none", 
+        text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ylab("Average GO:0060337 Expression") +
+  xlab("Day of Mechanical Ventilation")
+
+ggplot(covid_umap, aes(x = finite_day_of_intubation, y = IFNg_response)) +
+  geom_point() + 
+  geom_smooth(method = "lm", color = fig2_pal[2]) +
+  theme_bw() +
+  theme(legend.position = "none", 
+        text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ylab("Average GO:0060333 Expression") +
+  xlab("Day of Mechanical Ventilation")
+
+
+ggplot(covid_umap, aes(x = finite_day_of_intubation, y = general_IFN_response)) +
+  geom_point() + 
+  geom_smooth(method = "lm", color = fig2_pal[2]) +
+  theme_bw() +
+  theme(legend.position = "none", 
+        text = element_text(size = 32, family = "Arial"),
+        plot.title = element_text(hjust = 0.5)) +
+  ylab("Average IFN response Expression") +
+  xlab("Day of Mechanical Ventilation")
+```   
+   
+### Correlations   
+```{r}
+cor.test(covid_umap$typeI_IFN_response, covid_umap$finite_day_of_intubation)
+cor.test(covid_umap$IFNg_response, covid_umap$finite_day_of_intubation)
+cor.test(covid_umap$general_IFN_response, covid_umap$finite_day_of_intubation)
+```
+
+
+   
+# Second batch of pico optimization   
+Let's focus on interferon-hi vs interferon-low samples   
+### Identify interesting   
+```{r}
+last_batch = c(300312389, 304012699, 304017553, 304020298, 304020362,
+               340224808, 340233896, 340239789, 340239790, 340239805)
+good_samples = mp_des[, ((!is.na(mp_des$RIN) & mp_des$RIN >= 7) & 
+                    mp_des$STAR_mqc_generalstats_star_uniquely_mapped_percent >= 30 &
+                    mp_des$featureCounts_mqc_generalstats_featurecounts_percent_assigned >= 30) &
+                    mp_des$RNA_concentration_pg_ul >= 125]
+remaining_interesting = setdiff(good_samples$sample, last_batch)
+interesting_metadata = subset(total_umap, sample %in% remaining_interesting)
+table(interesting_metadata$pna_type)
+ggplot(interesting_metadata, aes(x = pna_type, y = AEpurple)) +
+  geom_boxplot()
+selection = interesting_metadata %>% 
+  filter(pna_type != "Other Pneumonia" | sample == 340235110) %>% 
+  dplyr::select(sample, tube_loc_macrophRNA_boxID, RNA_concentration_pg_ul) %>% 
+  mutate(dilution = ifelse((250 / RNA_concentration_pg_ul) < 0.4,
+                           yes = round(1 / (250 / RNA_concentration_pg_ul) / 5) * 5,
+                           no = 1)) %>% 
+  mutate(vol_for_250_pg = round(250 / RNA_concentration_pg_ul * dilution, digits = 2))
+write.csv(selection, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200713_pico_opt_batch2.csv")
+selection
+```
+   
+# Conclusions   
+## Output data for posterity   
+```{r}
+final_counts_raw = counts(mp_des, normalized = F)
+
+#clean metadata for safe sharing
+final_md_safe = colData(mp_des) %>% 
+  as.data.frame() %>% 
+  dplyr::select(sample, age, sex, race = races, ethnicity, diagnosis = pna_type, 
+                day_of_ventilation = finite_day_of_intubation, study_id)
+#convert script IDs to new identifiers
+id_conv = data.frame(script_id = sample(unique(final_md_safe$study_id))) %>% #shuffle IDs first
+  mutate(anonymized_patient_id = sprintf("%04d", 1:nrow(id_conv)))
+#add back to md
+final_md_safe = left_join(final_md_safe, id_conv, by = c("study_id" = "script_id")) %>% 
+  dplyr::select(-study_id)
+
+write.csv(final_counts_raw, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/200724_raw_counts_geo.csv")
+write.csv(final_md_safe, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/200724_deidentified_metadata_geo.csv")
+```
+

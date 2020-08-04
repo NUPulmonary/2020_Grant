@@ -1,0 +1,514 @@
+---
+title: "SCRIPT Bulk QC and Cleaning"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Goals   
+1. Process counts tables generated in 200526_bulk_sequence_processing.Rmd and ensure relatively consistent quality across batches, lack of batch effect. Apply batch correction as necessary.   
+2. Remove problem lanes and samples   
+3. Determine source of poor alignment and assignent, if any   
+      
+# Setup   
+## Load packages   
+```{r setup}
+library(tidyverse)
+library(DESeq2)
+library(googlesheets4)
+library(googledrive)
+library(ggplot2)
+library(ggforce)
+library(corrplot)
+library(viridis)
+library(biomaRt)
+library(patchwork)
+library(gtools)
+library(parallel)
+cores = 8
+mc = getOption("mc.cores", cores)
+
+source("~/utils/R/plotPCA_manual.R")
+
+options(stringsAsFactors = F)
+
+human_mart = useMart("ensembl", "hsapiens_gene_ensembl")
+ensembl_conv = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                     mart = human_mart)
+
+sessionInfo()
+```
+
+## Import data   
+### Metadata   
+log in to google drive (must be done interactively)
+```{r}
+drive_auth(use_oob = T, cache = T) # have to run in console :(
+gs4_auth(token = drive_token(), cache = T)
+```
+
+```{r}
+rna_metadata = read_sheet("https://docs.google.com/spreadsheets/d/15aq9UMRtTl5E75E5M0mXvbFfxVVuJxrXneKYpo6LzlE/edit#gid=897409272",
+                  trim_ws = T,
+                  .name_repair = "universal", 
+                  sheet = "SCRIPT_01 RNAseq Metadata",
+                  na = c("", "NA"))
+#clean up colnames
+colnames(rna_metadata) = gsub("\\.", "_", colnames(rna_metadata)) #I like underscores
+colnames(rna_metadata) = gsub("_+$", "", colnames(rna_metadata)) # remove trailing
+colnames(rna_metadata) = gsub("_+", "_", colnames(rna_metadata)) #remove dup underscores
+#tube and RIN are randomly read in as a list. fix this.
+rna_metadata$tubeid_macrophRNA = as.character(rna_metadata$tubeid_macrophRNA)
+rna_metadata$tubeid_macrophRNA[rna_metadata$tubeid_macrophRNA == "NULL"] = NA
+rna_metadata$RIN = as.numeric(as.character(rna_metadata$RIN))
+#take out problem cols (added back)
+rna_metadata = rna_metadata %>% 
+  dplyr::select(-c(RNAseq_batch, Batch_sample))
+#remove preceding zeros
+rna_metadata = rna_metadata %>% 
+  mutate_at("tubeid_macrophRNA", function(x){ gsub("^0", "", x) })
+#fix operator
+rna_metadata$Operator_RNA[grepl("Lango", rna_metadata$Operator_RNA)] = "Lango Sichizya"
+rna_metadata$Operator_RNA[grepl("Hermon", rna_metadata$Operator_RNA)] = "Hermon Kihshen"
+
+#keep track of batches
+batch_metadata = read_sheet("https://docs.google.com/spreadsheets/d/15aq9UMRtTl5E75E5M0mXvbFfxVVuJxrXneKYpo6LzlE/edit#gid=897409272",
+                  trim_ws = T,
+                  .name_repair = "universal", 
+                  sheet = "SCRIPT_01 RNAseq Library prep layouts",
+                  na = c("", "NA"))
+batch_metadata = batch_metadata %>% 
+  dplyr::select(-c(Library.prep.date, Comments)) %>% 
+  mutate_at(.vars = "RNA.tube.ID", function(x){
+    x = gsub("_*R", "", as.character(x), ignore.case = T)}) #repeats are handled better by batch
+
+#merge with rna metadata to account for repeats
+rna_metadata = right_join(rna_metadata, 
+                         batch_metadata,
+                         by = c("tubeid_macrophRNA" = "RNA.tube.ID", "tc_pt_study_id" = "Sample")) %>% 
+  filter(!is.na(RNAseq_batch))
+
+#clean up colnames
+colnames(batch_metadata) = gsub("\\.", "_", colnames(batch_metadata)) #I like underscores
+colnames(batch_metadata) = gsub("_+$", "", colnames(batch_metadata)) # remove trailing
+colnames(batch_metadata) = gsub("_+", "_", colnames(batch_metadata)) #remove dup underscores
+#ignore samples for now
+batch_metadata = batch_metadata %>% 
+  dplyr::select(RNAseq_batch, Sequencing_Run_ID) %>% 
+  na.omit() %>% 
+  unique() %>% 
+  filter(!duplicated(RNAseq_batch)) #this ignores repeats for now. Not really relevant to "batch"
+batch_metadata = rbind(batch_metadata, c("SCRIPT_RNAseq_Batch_07", "SCRIPT_BATCH_07")) #account for basespace transfer
+batch_metadata = as.data.frame(batch_metadata)
+```
+   
+### Pipeline QC data   
+```{r}
+seq_dirs = dir(path = "/projects/b1038/Pulmonary/rgrant/script_bulk",
+               pattern = "^(\\d|S).*",
+               all.files = F, 
+               full.names = T, 
+               recursive = F)
+mqc_tables = mclapply(seq_dirs, function(dir){
+  if(grepl("200520_NB501488_0357_AHHVH5BGXF_copy_RAG", dir)) #because of testing file structure is different
+  {
+    mqc_path = paste0(dir, "/GRCh37_comparison/results/MultiQC/multiqc_data/multiqc_general_stats.txt")
+  } else
+  {
+    mqc_path = paste0(dir, "/results/MultiQC/multiqc_data/multiqc_general_stats.txt")
+  }
+  
+  mqc = read.delim(mqc_path)
+  
+  #make sure all samples have unique names (hURNA and repeats)
+  run = gsub("_copy_RAG", "", basename(dir))
+  batch = batch_metadata[which(batch_metadata$Sequencing_Run_ID == run), "RNAseq_batch"]
+  mqc$batch = batch
+  return(mqc)
+})
+
+mqc_metadata = bind_rows(mqc_tables) %>% 
+  filter(!is.na(QualiMap_mqc.generalstats.qualimap.reads_aligned)) #weird empty rows
+mqc_metadata$Sample = paste0(mqc_metadata$Sample, "_R1_001") #format correctly
+colnames(mqc_metadata) = gsub("\\.", "_", colnames(mqc_metadata)) #I like underscores
+colnames(mqc_metadata) = gsub("_+$", "", colnames(mqc_metadata)) # remove trailing
+colnames(mqc_metadata) = gsub("_+", "_", colnames(mqc_metadata)) #remove dup underscores
+mqc_metadata$lane_run = paste(mqc_metadata$Sample, mqc_metadata$batch, sep = "_")
+```
+   
+## Flow data   
+```{r}
+flow_data = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/2020-07-24_SCRIPT_flow_plus_clinical_metadata_processed.rds") %>% 
+  dplyr::select(tubeid_macrophRNA, percent_total_CD206_high:percent_others)
+```
+
+      
+### Counts tables   
+```{r}
+name_conversion = read.delim("/projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/results/featureCounts/merged_gene_counts.txt") %>%
+  dplyr::select(gene_name, Geneid) %>% 
+  column_to_rownames(var = "Geneid") #for later conversion due to mixed IDs
+counts_tables = mclapply(seq_dirs, function(dir){
+  if(grepl("200520_NB501488_0357_AHHVH5BGXF_copy_RAG", dir)) #because of testing file structure is different
+  {
+    counts_path = paste0(dir, "/GRCh37_comparison/results/featureCounts/merged_gene_counts.txt")
+  } else
+  {
+    counts_path = paste0(dir, "/results/featureCounts/merged_gene_counts.txt")
+  }
+  
+  counts = read.delim(counts_path) %>% 
+    dplyr::select(-gene_name) #really nice feature but can't make a matrix this way
+  
+  #make sure all samples have unique names (hURNA and repeats)
+  run = gsub("_copy_RAG", "", basename(dir))
+  batch = batch_metadata[which(batch_metadata$Sequencing_Run_ID == run), "RNAseq_batch"]
+  colnames(counts) = gsub("Aligned.sortedByCoord.out.bam", 
+                          paste0("_", batch), 
+                          colnames(counts))
+  return(counts)
+})
+
+#merge into single table
+merged_counts = counts_tables %>% 
+  purrr::reduce(full_join, by = "Geneid") %>% 
+  column_to_rownames(var = "Geneid")
+#clean up sample names
+colnames(merged_counts) = gsub("^X", "", colnames(merged_counts))
+
+#clean up workspace
+rm(counts_tables)
+```
+   
+## Construct DESeq dataset   
+```{r}
+#strip sample data
+md = data.frame(lane_run = colnames(merged_counts))
+md$sample = factor(substring(md$lane_run, 1, (regexpr("_S\\d", md$lane_run) - 1)))
+md$sample_num = factor(substring(md$lane_run, (regexpr("_S\\d", md$lane_run) + 1), (regexpr("_L", md$lane_run) - 1)))
+md$lane = factor(substring(md$lane_run, (regexpr("_L", md$lane_run) + 1), (regexpr("_R", md$lane_run) - 1)))
+md$run = factor(substring(md$lane_run, (regexpr("_R\\d", md$lane_run) + 1), (regexpr("_\\d{3}", md$lane_run) - 1)))
+md$number = factor(substring(md$lane_run, (regexpr("_\\d{3}", md$lane_run) + 1), (regexpr("_SC", md$lane_run) - 1)))
+md$batch = factor(substring(md$lane_run, (regexpr("_SC", md$lane_run) + 1)))
+md$sample_type = factor(ifelse(grepl("hURNA", md$sample),
+                        yes = "hURNA_control",
+                        no = "sample"))
+md$merge_sample = gsub("_R", "", md$sample)
+
+#merge with RNA metadata
+md = left_join(md, rna_metadata, by = c("merge_sample" = "tubeid_macrophRNA", "batch" = "RNAseq_batch"))
+md$sort_dt_cyto = as.Date(md$sort_dt_cyto) #hours are not correct
+
+
+#merge with clinical metadata   
+clinical_md = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/2020-07-24_SCRIPT_clinical_metadata_processed.rds")
+md = left_join(md, 
+               clinical_md, 
+               by = c("tc_pt_study_id"), 
+               na_matches = "never")
+rownames(md) = md$lane_run
+md$sample_batch = paste(md$sample, md$batch, sep = "_") #these should be unique
+
+#merge with mutliqc metadata
+md = left_join(md, mqc_metadata, by = c("lane_run", "batch"))
+
+#merge with flow data
+md = left_join(md, 
+               flow_data,
+               by = c("sample" = "tubeid_macrophRNA"))
+
+#update cols as necessary
+md$covid_confirmed[is.na(md$covid_confirmed)] = FALSE #not terribly safe but necessary for now
+md$Operator_RNA = factor(md$Operator_RNA)
+md$batch = factor(md$batch)
+
+script_bulk = DESeqDataSetFromMatrix(countData = merged_counts,
+                                     colData = md,
+                                     design = ~ covid_confirmed + batch)
+rowData(script_bulk) = name_conversion
+script_bulk_samples = script_bulk[ , script_bulk$sample_type == "sample"] #hURNA free version
+```
+   
+# Summary metrics   
+## Patient numbers   
+### Totals
+```{r}
+patient_data = md %>% 
+  dplyr::select(patient_id, covid_confirmed) %>% 
+  filter(!is.na(patient_id)) %>% 
+  unique()
+table(patient_data$covid_confirmed, useNA = "always")
+```   
+   
+### Day 0 samples   
+```{r}
+patient_data_d0 = md %>% 
+  dplyr::select(patient_id, covid_confirmed, day_of_intubation) %>% 
+  filter(!is.na(patient_id) & day_of_intubation <= 2 & day_of_intubation >= 0) %>% 
+   dplyr::select(patient_id, covid_confirmed) %>% 
+  unique()
+table(patient_data_d0$covid_confirmed)
+``` 
+   
+## Samples per patient   
+```{r}
+n_samples_patient = as.data.frame(table(md$patient_id) / 4)
+
+ggplot(n_samples_patient, aes(x = Freq)) +
+  geom_histogram(binwidth = 1) +
+  xlab("Bulk Samples per Patient") +
+  ylab("Number of Patients")
+```
+
+   
+# QC   
+## Alignment and assignment   
+### Summarize by sample (not lane)   
+```{r}
+mqc_summary_aa = mqc_metadata %>% 
+  dplyr::filter(!grepl("hURNA", Sample)) %>% 
+  mutate(merged_sample = factor(substring(Sample, 1, regexpr("\\d_", Sample)))) %>% 
+  group_by(merged_sample) %>% 
+  summarise_at(.vars = c("STAR_mqc_generalstats_star_uniquely_mapped_percent", 
+         "featureCounts_mqc_generalstats_featurecounts_percent_assigned"), .group = "keep", .funs = mean) %>% 
+  pivot_longer(cols = c("STAR_mqc_generalstats_star_uniquely_mapped_percent", 
+         "featureCounts_mqc_generalstats_featurecounts_percent_assigned"), names_to = "sequencing_metric") %>% 
+  as.data.frame()
+
+mqc_summary_num_seqs = mqc_metadata %>% 
+  dplyr::filter(!grepl("hURNA", Sample)) %>% 
+  mutate(merged_sample = factor(substring(Sample, 1, regexpr("\\d_", Sample)))) %>% 
+  group_by(merged_sample) %>% 
+  summarise(value = sum(FastQC_mqc_generalstats_fastqc_total_sequences), .groups = "keep") %>% 
+  mutate(sequencing_metric = "total_sequences") %>% 
+  as.data.frame()
+mqc_summary_num_seqs = mqc_summary_num_seqs[, colnames(mqc_summary_aa)] #fix col order
+
+mqc_summary = rbind(mqc_summary_aa, mqc_summary_num_seqs) %>% 
+  mutate(percent_col = grepl("percent", sequencing_metric)) %>% 
+  mutate(sequencing_metric = factor(sequencing_metric))
+```
+   
+### Summary plots   
+```{r}
+aa_plot = ggplot(mqc_summary, aes(x = sequencing_metric, y = value, fill = sequencing_metric)) +
+  geom_boxplot(notch = T, outlier.shape = NA) + 
+  scale_fill_manual(name = "",
+                    limits = c("STAR_mqc_generalstats_star_uniquely_mapped_percent", "featureCounts_mqc_generalstats_featurecounts_percent_assigned", "total_sequences"),
+                    labels = c("Percent Uniquely Aligned (STAR)", "Percent Assigned (FeatureCounts)", "Total Reads"),
+                    values = c("#003B7D", "#B10026", "#BFB400")) +
+  geom_point(position = "jitter", size = 0.2) +
+  xlab("") +
+  ylab("") +
+  ggforce::facet_row(~ percent_col, scales = "free", space = "free") +
+  theme(strip.background = element_blank(), strip.text.x = element_blank(), 
+        axis.ticks.x=element_blank(), axis.text.x=element_blank())
+aa_plot
+```
+      
+### ANOVA   
+```{r}
+response = cbind(percent_mapped = mqc_summary$STAR_mqc_generalstats_star_uniquely_mapped_percent,
+                   percent_assigned = md$featureCounts_mqc_generalstats_featurecounts_percent_assigned)
+fit = manova(cbind(md$STAR_mqc_generalstats_star_uniquely_mapped_percent,
+                   md$featureCounts_mqc_generalstats_featurecounts_percent_assigned) ~ 
+               RIN + batch + Operator_RNA,
+             data = md)
+summary.aov(fit)
+```   
+Hard to differentiate batch and operator, but I had a feeling this would be the case. My numbers are clearly lower. Very interesting that RIN contributes only to mapping, not assignment.      
+   
+## Effect of number of sorted cells   
+### ANOVA   
+```{r}
+fit = manova(cbind(md$RIN,
+                   md$RNA_concentration_pg_ul) ~ 
+               num_sort_macroph,
+             data = md)
+summary.aov(fit)
+```   
+   
+### Plotting
+```{r}
+ggplot(md, aes(x = STAR_mqc_generalstats_star_uniquely_mapped_percent, 
+               y = featureCounts_mqc_generalstats_featurecounts_percent_assigned,
+               color = RIN)) +
+  geom_point() +
+  scale_color_viridis()
+
+ggplot(md, aes(x = STAR_mqc_generalstats_star_uniquely_mapped_percent, 
+               y = featureCounts_mqc_generalstats_featurecounts_percent_assigned,
+               color = batch)) +
+  geom_point() +
+  stat_ellipse()
+
+ggplot(md, aes(x = STAR_mqc_generalstats_star_uniquely_mapped_percent, 
+               y = featureCounts_mqc_generalstats_featurecounts_percent_assigned,
+               color = Operator_RNA)) +
+  geom_point() +
+  stat_ellipse()
+```
+   
+Seems to be pretty variable between batch, with perhaps some influence from operator. I amy be better off preparing fewer plates at a time in the future (4-6 were prepared together). There are a lot of "hidden" variables in each batch, however. Batches 5-7 seem to be of the lowest quality, whereas 3 and 4 are the best by far.  
+   
+## hURNA Correspondence   
+### Subset   
+```{r}
+hURNA = script_bulk[, script_bulk$sample_type == "hURNA_control"]
+hURNA = collapseReplicates(hURNA, groupby = hURNA$sample_batch)
+```
+   
+### Corplot   
+```{r}
+hURNA_counts = counts(hURNA, normalized = F)
+cors = cor(hURNA_counts)
+colnames(cors) = substring(colnames(cors), 21)
+rownames(cors) = substring(rownames(cors), 21)
+corrplot(cors, 
+         method = "square",
+         type = "upper",
+         tl.col="black",
+         addCoef.col = "white",
+         tl.srt=45)
+```   
+As expected, very high correspondence.   
+   
+### PCA   
+```{r}
+plotPCA(vst(hURNA), intgroup = "batch")
+```
+Based on the correlations, it's fair to say these differences are probably quite minor.   
+   
+## Identify bad lanes      
+### PCA   
+With hURNA   
+```{r}
+d = plotPCA(vst(script_bulk), 
+        intgroup = c("sample_batch"),
+        returnData = T)
+ggplot(d, aes(x = PC1, y = PC2, color = sample_batch)) +
+   geom_point() +
+   stat_ellipse(aes(x = PC1, y = PC2, color = sample_batch), inherit.aes = F) +
+  theme(legend.position = "none")
+```  
+   
+Without
+```{r}
+d = plotPCA(vst(script_bulk_samples), 
+        intgroup = c("sample_batch"),
+        returnData = T)
+ggplot(d, aes(x = PC1, y = PC2, color = sample_batch)) +
+   geom_point() +
+   stat_ellipse(aes(x = PC1, y = PC2, color = sample_batch), inherit.aes = F) +
+  theme(legend.position = "none")
+```   
+We should be good on all samples - clusters are pretty tight, with no dramatic outliers. A few have modest, but acceptable spread.      
+   
+### Collapse lanes
+```{r}
+script_bulk = collapseReplicates(script_bulk,
+                                 groupby = script_bulk$sample_batch)
+script_bulk_samples = collapseReplicates(script_bulk_samples,
+                                 groupby = script_bulk_samples$sample_batch)
+```   
+
+## Determine what to do with repeats   
+### Add repeat flag   
+```{r}
+script_bulk$is_repeat = duplicated(script_bulk$sample) & script_bulk$sample_type == "sample"
+script_bulk_samples$is_repeat = duplicated(script_bulk_samples$sample)
+repeated_samples = script_bulk$sample[script_bulk$is_repeat]
+```
+   
+### PCA   
+```{r}
+d = plotPCA(vst(script_bulk_samples), 
+        intgroup = c("sample_batch", "sample", "is_repeat"),
+        returnData = T)
+d$highlight = d$sample %in% repeated_samples
+ggplot(NULL) +
+  geom_point(data = d, aes(x = PC1, y = PC2), alpha = 0.2) +
+  geom_point(data = subset(d, highlight), aes(x = PC1, y = PC2, color = sample, shape = is_repeat), alpha = 1, size = 3)
+```
+   
+Personally I vote to include both technical replicates and just collapse them. Given the clear similarity, any difference should be due to non-biological noise. We can always undo this later, but for now I will join them.   
+   
+### Join as technical replicates   
+```{r}
+script_bulk$safe_sample = ifelse(grepl("hURNA", script_bulk$sample),
+                                 yes = paste(script_bulk$sample, script_bulk$batch, sep = "_"),
+                                 no = script_bulk$sample)
+script_bulk = collapseReplicates(script_bulk,
+                                 groupby = script_bulk$safe_sample)
+script_bulk_samples = collapseReplicates(script_bulk_samples,
+                                 groupby = script_bulk_samples$sample)
+```   
+   
+## Batch effects   
+### PCA   
+With hURNA   
+```{r}
+d = plotPCA(vst(script_bulk), 
+        intgroup = c("batch", "sample_type"),
+        returnData = T)
+ggplot(d, aes(x = PC1, y = PC2, color = batch, shape = sample_type)) +
+   geom_point() +
+   stat_ellipse(aes(x = PC1, y = PC2, color = batch, linetype = sample_type), inherit.aes = F)
+```     
+Outlier 1 is 340228404 (SE). My comments on RNA trace: “Substantial degradation; serial sample. RAG”. Extremely poor alignment. Discard. Outlier 2 is 368522778 (NW). My comments on RNA trace: “No visible peaks”. Extremely poor alignment. Discard as well.    
+   
+```{r}
+script_bulk = script_bulk[, !(script_bulk$sample %in% c("340228404", "368522778"))]
+script_bulk_samples = script_bulk_samples[, !(script_bulk_samples$sample %in% c("340228404", "368522778"))]
+```
+   
+With hURNA after cleaning   
+```{r}
+d = plotPCA(vst(script_bulk), 
+        intgroup = c("batch", "sample_type"),
+        returnData = T)
+ggplot(d, aes(x = PC1, y = PC2, color = batch, shape = sample_type)) +
+   geom_point() +
+   stat_ellipse(aes(x = PC1, y = PC2, color = batch, linetype = sample_type), inherit.aes = F)
+```  
+   
+Without
+```{r}
+d = plotPCA(vst(script_bulk_samples), 
+        intgroup = c("batch"),
+        returnData = T)
+ggplot(d, aes(x = PC1, y = PC2, color = batch)) +
+   geom_point() +
+   stat_ellipse(aes(x = PC1, y = PC2, color = batch), inherit.aes = F)
+```   
+   
+Looks pretty great overall. I think we can probably rule out major batch effect, but it may still be worth comparing the two models.   
+   
+# Initial analysis   
+## What are the key differentiating genes?   
+```{r}
+pca_data = plotPCA_manual(vst(script_bulk_samples), 
+        intgroup = c("batch"))
+loadings = as.data.frame(pca_data$pca$rotation)
+loadings = loadings %>% 
+  rownames_to_column(var = "ensembl_gene_id") %>% 
+  left_join(., ensembl_conv)
+loadings$id = ifelse(is.na(loadings$external_gene_name),
+                     yes = loadings$ensembl_gene_id,
+                     no = loadings$external_gene_name)
+loadings = loadings %>% 
+  column_to_rownames(var = "id") %>% 
+  dplyr::select(PC1:PC10)
+```   
+PC1 is driven positively by lipid metabolism genes, such as FABP4, many of which are AM markers. Negative loadings may suggest MoAM presence: SPP1 is the first hit. More interesting though: it’s driven most strongly in that direction by Il8 and Il1b https://iai.asm.org/content/80/3/1140.short. PC2 is honestly not that different, but seems to have some proliferation character in the negative direction, homeotstatic MP function in the positive (MERTK, STAB1). Also some inflammatory character: F13A1, CCL2.   
+   
+# Export for high-level analysis   
+```{r}
+saveRDS(script_bulk, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_script_bulk_des.rds")
+saveRDS(script_bulk_samples, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200721_script_bulk_des_no_hURNA.rds")
+```
+
+      
+# Conclusions   
+1. Although there is some variability in sequencing quality, mapped and assigned reads lead to a very clean dataset with good between-batch correspondence.   
+2. Separation on PCA appears to be driven by real biological phenomena, based on enrichment of macrophage genes in the key PC loadings. Separation may be by AM subtype, expansion, and inflammation.   
