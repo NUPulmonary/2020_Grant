@@ -6,3 +6,5 @@ The purpose of SCRIPT is to identify host and pathogen factors that predict succ
 This page contains de-identified data from our published manuscripts that can be explored using intuitive tools.    
    
 SCRIPT is a multidisciplinary effort that involves investigators across disciplines at Northwestern. We are proud to have more than 100 contributing authors to our publications all of whom are dedicated to improving the care of patients with pneumonia and meeting the challenge of the COVID-19 pandemic (PUT LINK HERE).
+
+![Schematic](https://github.com/NUPulmonary/2020_Grant/blob/master/Screen%20Shot%202020-08-04%20at%201.36.35%20PM.png)
