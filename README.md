@@ -7,4 +7,4 @@ This page contains de-identified data from our published manuscripts that can be
    
 SCRIPT is a multidisciplinary effort that involves investigators across disciplines at Northwestern. We are proud to have more than 100 contributing authors to our publications all of whom are dedicated to improving the care of patients with pneumonia and meeting the challenge of the COVID-19 pandemic ([author list](https://github.com/NUPulmonary/2020_Grant/blob/master/author_list.xlsx)).
 
-<img src="https://github.com/NUPulmonary/2020_Grant/blob/master/schematic.png" width="498" height="620">
+<img src="https://github.com/NUPulmonary/2020_Grant/blob/master/schematic.png" width="332" height="413"> <img src="https://github.com/NUPulmonary/2020_Grant/blob/master/SCRIPT_logo.jpg" width="332" height="332">
