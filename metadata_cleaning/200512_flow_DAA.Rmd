@@ -1091,9 +1091,9 @@ timeline_data_covid = timeline_data_covid[-remove, ]
 #fix duplicate entries
 timeline_data_covid = timeline_data_covid %>% 
   unique() %>% 
-  dplyr::filter(!(study_id == 1240 & event == "death" & date == as.Date("2020-04-18"))) %>% 
-  dplyr::filter(!(study_id == 1292 & event == "death" & date == as.Date("2020-06-04"))) %>% 
-  dplyr::filter(!(study_id == 1296 & event == "death" & date == as.Date("2020-06-21"))) %>% 
+  dplyr::filter(!(study_id == 1240 & event == "death" & date == as.Date("XXXXXXXXXX"))) %>% 
+  dplyr::filter(!(study_id == 1292 & event == "death" & date == as.Date("XXXXXXXXXX"))) %>% 
+  dplyr::filter(!(study_id == 1296 & event == "death" & date == as.Date("XXXXXXXXXX"))) %>% 
   dplyr::filter(!(study_id == 1311)) #missing most data
 
 intubation_periods_covid = timeline_data_covid %>% 
