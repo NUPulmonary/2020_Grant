@@ -1,0 +1,1114 @@
+---
+title: "SCRIPT Bulk Sequence Processing"
+output: html_notebook
+---
+
+## Goals   
+1. "Create" a combined human and SARS-CoV-2 genome using Nikolay's prepared files   
+2. Align all SCRIPT bulk libraries to this genome using the nf-core/rna-seq pipeline   
+3. Prepare DESeq objects for each dataset for processing in another document   
+   
+# Setup   
+## Load packages   
+```{r setup}
+library(DESeq2)
+library(rtracklayer)
+options(stringsAsFactors = F)
+
+source("~/utils/R/clean_sample_sheet.R")
+```
+
+# Prepare genome(s) for nextflow   
+## Human + SARS-CoV-2   
+   
+FASTA and GTF copied directly from Nik's genome at /projects/b1038/Pulmonary/nmarkov/script/data/SARS-CoV-2i_and_GRCh38   
+   
+## Human + SARS-CoV-2 + IAV   
+   
+Based on FluView data (CDC) from region 5 (midwest), the following strains were predominant top 3:   
+- October, 2017 - October, 2018: IAV H3NX, IBV Yamagata, IAV H1N1   
+- October, 2018 - October, 2019: IAV H1N1, IAV H3NX, little else   
+- October, 2019 - October, 2020: IAV H1N1, IBV Victoria, little else   
+Likely most IAV viruses will align decently well regardless of serotype. IBV remains to be seen. Given that very few are from before winter 2018, it seems fair to choose an H1N1 genome and just be aware of the fact that not all reads are definitely from H1N1 strains. Adding more than one strain genome will likely be counterproductive, as many reads will be thrown out due to multi-mapping.     
+   
+```{bash eval=FALSE}
+mkdir /projects/p30623/reference_genomes/hybrid_genomes; cd /projects/p30623/reference_genomes/hybrid_genomes
+mkdir human_viral_pneumonia; cd human_viral_pneumonia
+
+#GRCh38, ensembl v100
+mkdir /projects/p30623/reference_genomes/GRCh38_hardcopy; cd /projects/p30623/reference_genomes/GRCh38_hardcopy
+wget 'ftp://ftp.ensembl.org/pub/release-100/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz' #soft-masked for general usability
+wget 'ftp://ftp.ensembl.org/pub/release-100/gtf/homo_sapiens/Homo_sapiens.GRCh38.100.gtf.gz'
+wget 'ftp://ftp.ensembl.org/pub/release-100/gff3/homo_sapiens/Homo_sapiens.GRCh38.100.gff3.gz'
+gunzip *.gz
+#make BED from gtf
+gffread 'Homo_sapiens.GRCh38.100.gff3' --bed -o 'Homo_sapiens.GRCh38.100.bed'
+
+#GRCh37, ensembl v100
+mkdir /projects/p30623/reference_genomes/GRCh37_hardcopy; cd /projects/p30623/reference_genomes/GRCh37_hardcopy
+wget 'ftp://ftp.ensembl.org/pub/grch37/release-100/fasta/homo_sapiens/dna/Homo_sapiens.GRCh37.dna_sm.primary_assembly.fa.gz'
+wget 'ftp://ftp.ensembl.org/pub/grch37/release-100/gtf/homo_sapiens/Homo_sapiens.GRCh37.87.gtf.gz'
+wget 'ftp://ftp.ensembl.org/pub/grch37/release-100/gff3/homo_sapiens/Homo_sapiens.GRCh37.87.gff3.gz'
+gunzip *.gz
+#make BED from gtf
+gffread 'Homo_sapiens.GRCh37.87.gff3' --bed -o 'Homo_sapiens.GRCh37.87.bed'
+
+#SARS_CoV_2 (045512 Wuhan), version 2
+mkdir /projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2; cd /projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2
+wget 'https://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&save=file&log$=seqview&db=nuccore&report=fasta&id=1798174254&conwithfeat=on&withparts=on&hide-cdd=on' -O 'NC_045512_2.fa'
+wget 'https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/858/895/GCF_009858895.2_ASM985889v3/GCF_009858895.2_ASM985889v3_genomic.gff.gz'
+gunzip *.gz
+
+#IAV H1N1
+mkdir /projects/p30623/reference_genomes/CF_001343785.1; cd /projects/p30623/reference_genomes/CF_001343785.1
+wget 'ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/001/343/785/GCF_001343785.1_ViralMultiSegProj274766/GCF_001343785.1_ViralMultiSegProj274766_genomic.fna.gz'
+wget 'ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/001/343/785/GCF_001343785.1_ViralMultiSegProj274766/GCF_001343785.1_ViralMultiSegProj274766_genomic.gff.gz'
+gunzip *.gz
+```   
+   
+### Edit GFFs for joining   
+```{r}
+#CoV2
+cov2_gff = readGFF("/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic.gff", 
+                   version = 3)
+cov2_gff = subset(cov2_gff, type == "gene") #this is all we really care about
+cov2_antisense = list("NC_045512.2", "RefSeq", "gene", 1, 29903,
+                      NA, "-", 0, "SARS_CoV_2_antisense_genome", "",
+                      NA, NA, NA, "Gene", NA,
+                      NA, NA, NA, NA, "SARS_CoV_2_antisense_genome",
+                      "SARS_CoV_2_antisense_genome", "antisense", NA, NA, NA,
+                      NA, NA, NA, NA, NA,
+                      NA)
+names(cov2_antisense) = names(cov2_gff)
+cov2_gff = rbind(cov2_gff,
+                 cov2_antisense)
+cov2_gff = cov2_gff[order(cov2_gff$start, decreasing = F), ] #have to sort for success
+export.gff3(cov2_gff, 
+            "/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gff")
+
+#IAV H1N1 (can't distinguish genomic and transcript -- negative sense)
+iav_gff = readGFF("/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic.gff", 
+                   version = 3)
+iav_gff = subset(iav_gff, type == "gene") 
+export.gff3(iav_gff, 
+            "/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gff")
+```
+
+### Generate additional files   
+gffread version 
+```{bash eval=FALSE}
+module load gffread/0.9.11
+
+# CoV2
+gffread  \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gff' \
+-T \
+-F \
+ --gene2exon \
+-o '/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gtf' #make gtf from gff
+gffread  \
+--gene2exon \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gff' \
+--bed \
+-o '/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.bed' #make BED from gff
+
+#H1N1
+gffread  \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gff' \
+-T \
+-F \
+ --gene2exon \
+-o '/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gtf' #make gtf from gff
+gffread \
+ --gene2exon \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gff' \
+--bed \
+-o '/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.bed' #make BED from gff
+
+#GRCh38 hybrid genome
+cd /projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/
+#join GTFs
+cat '/projects/p30623/reference_genomes/GRCh38_hardcopy/Homo_sapiens.GRCh38.100.gtf' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gtf' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gtf' > 'human_viral_pneumonia.gtf'
+#join genomes
+cat '/projects/p30623/reference_genomes/GRCh38_hardcopy/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/NC_045512_2.fa' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic.fna' > 'human_viral_pneumonia.fa'
+#join BED files
+cat '/projects/p30623/reference_genomes/GRCh38_hardcopy/Homo_sapiens.GRCh38.100.bed' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.bed' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.bed' > 'human_viral_pneumonia.bed'
+#join GFFs 
+cat '/projects/p30623/reference_genomes/GRCh38_hardcopy/Homo_sapiens.GRCh38.100.gff3' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gff' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gff' > 'human_viral_pneumonia.gff'
+
+#GRCh37 hybrid genome
+mkdir /projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/
+cd /projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/
+#join GTFs
+cat '/projects/p30623/reference_genomes/GRCh37_hardcopy/Homo_sapiens.GRCh37.87.gtf' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gtf' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gtf' > 'human_viral_pneumonia_GRCh37.gtf'
+#join genomes
+cat '/projects/p30623/reference_genomes/GRCh37_hardcopy/Homo_sapiens.GRCh37.dna_sm.primary_assembly.fa' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/NC_045512_2.fa' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic.fna' > 'human_viral_pneumonia_GRCh37.fa'
+#join BED files
+cat '/projects/p30623/reference_genomes/GRCh37_hardcopy/Homo_sapiens.GRCh37.87.bed' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.bed' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.bed' > 'human_viral_pneumonia_GRCh37.bed'
+#join GFFs 
+cat '/projects/p30623/reference_genomes/GRCh37_hardcopy/Homo_sapiens.GRCh37.87.gff3' \
+'/projects/p30623/reference_genomes/SARS_CoV_2_NC_045512.2/GCF_009858895.2_ASM985889v3_genomic_cleaned.gff' \
+'/projects/p30623/reference_genomes/CF_001343785.1/GCF_001343785.1_ViralMultiSegProj274766_genomic_cleaned.gff' > 'human_viral_pneumonia_GRCh37.gff'
+
+#make STAR indices
+#GRCh38
+cd /projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/
+module load STAR/2.6.0
+mkdir human_viral_pneumonia_star_index
+STAR \
+--runMode genomeGenerate \
+--runThreadN 4 \
+--sjdbGTFfile 'human_viral_pneumonia.gtf' \
+--genomeDir human_viral_pneumonia_star_index/ \
+--genomeFastaFiles 'human_viral_pneumonia.fa'
+
+#GRCh37
+cd /projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/
+module load STAR/2.6.0
+mkdir human_viral_pneumonia_GRCh37_star_index
+STAR \
+--runMode genomeGenerate \
+--runThreadN 4 \
+--sjdbGTFfile 'human_viral_pneumonia_GRCh37.gtf' \
+--genomeDir human_viral_pneumonia_GRCh37_star_index/ \
+--genomeFastaFiles 'human_viral_pneumonia_GRCh37.fa'
+```
+
+       
+### Config   
+$HOME/.nextflow/config file:
+```{bash eval=FALSE}
+process.executor = 'slurm'
+process.queue = 'genomics'
+process.clusterOptions = '-A b1042'
+singularity.cacheDir = '/projects/b1038/Pulmonary/rgrant/nextflow_cache'
+NXF_WORK = '/projects/b1042/MisharinLab/rgrant/scratch'
+
+params
+{
+  genomes
+  {
+    'GRCm38_hardcopy'
+    {
+      fasta	  = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Sequence/WholeGenomeFasta/genome.fa"
+      bwa         = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Sequence/BWAIndex/genome.fa"
+      bowtie2     = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Sequence/Bowtie2Index/"
+      star        = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Sequence/STARIndex/"
+      bismark     = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Sequence/BismarkIndex/"
+      gtf         = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Annotation/Genes/genes.gtf"
+      bed12	  = "/projects/p30623/reference_genomes/Mus_musculus/Ensembl/GRCm38/Annotation/Genes/genes.bed"
+      mito_name   = "MT"
+      macs_gsize  = "1.87e9"
+      blacklist   = "${baseDir}/assets/blacklists/GRCm38-blacklist.bed"
+    }
+    'GRCh38_SARS-CoV-2'
+    {
+      fasta	  = "/projects/p30623/reference_genomes/Homo_sapiens/Ensembl/GRCh38_SARS-CoV-2/Sequence/WholeGenomeFasta/genome.fa"
+      star        = "/projects/p30623/reference_genomes/Homo_sapiens/Ensembl/GRCh38_SARS-CoV-2/Sequence/STARIndex/"
+      gtf         = "/projects/p30623/reference_genomes/Homo_sapiens/Ensembl/GRCh38_SARS-CoV-2/Annotation/Genes/genes.gtf"
+    }
+    'human_viral_pneumonia'
+    {
+      fasta = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/human_viral_pneumonia.fa"
+      star = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/human_viral_pneumonia_star_index/"
+      gtf = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/human_viral_pneumonia.gtf"
+      bed12 = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/human_viral_pneumonia.bed"
+      gff = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia/human_viral_pneumonia.gff"
+    }
+    'human_viral_pneumonia_GRCh37'
+    {
+      fasta = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/human_viral_pneumonia_GRCh37.fa"
+      star = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/human_viral_pneumonia_GRCh37_star_index"
+      gtf = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/human_viral_pneumonia_GRCh37.gtf"
+      bed12 = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/human_viral_pneumonia_GRCh37.bed"
+      gff = "/projects/p30623/reference_genomes/hybrid_genomes/human_viral_pneumonia_GRCh37/human_viral_pneumonia_GRCh37.gff"
+    }
+  }
+}
+
+//adjust	maximum	job params
+process 
+{
+  withName:multiqc 
+  {
+    time = '47.h'
+    memory = '50.GB'
+  }
+}
+```   
+Necessary files copied over from Nik's directories
+   
+# Run pipeline   
+## Generate fastq   
+### Batch 5   
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/SCRIPT batch 5 SMART Stranded Total RNA seq.xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-05-20",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200527_SCRIPT_batch5_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200527_SCRIPT_batch5_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```
+   
+### Batch 7   
+Pull from basespace   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk
+module load basespace/0.8.1
+bs auth
+bs-cp https://basespace.illumina.com/run/195479294 SCRIPT_BATCH_07
+```   
+   
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/SCRIPT_BATCH_07/SCRIPT batch 7 SMART Stranded Total RNA seq.xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-05-29",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200602_SCRIPT_batch7_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200602_SCRIPT_batch7_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/SCRIPT_BATCH_07/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 6
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/SCRIPT batch 6 SMART Stranded Total RNA seq.xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-05-28",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200602_SCRIPT_batch6_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200602_SCRIPT_batch6_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 1
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/190614_NB501488_0294_AHHNVYBGXB_copy_RAG/batch01_sample_sheet_template.xlsx",
+                   sheet = "Basespace",
+                   date = "2019-06-14",
+                   species = "Homo sapiens",
+                   investigator = "Darryl Abbott")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200602_SCRIPT_batch1_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200602_SCRIPT_batch1_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190614_NB501488_0294_AHHNVYBGXB_copy_RAG/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 2
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/190617_NB501488_0295_AHHN7WBGXB_copy_RAG/batch02_sample_sheet_template.xlsx",
+                   sheet = "Basespace",
+                   date = "2019-06-17",
+                   species = "Homo sapiens",
+                   investigator = "Darryl Abbott")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200602_SCRIPT_batch2_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200602_SCRIPT_batch2_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190617_NB501488_0295_AHHN7WBGXB_copy_RAG/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```
+   
+### Batch 3
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/190618_NB501488_0296_AHHKCKBGXB_copy_RAG/batch03_sample_sheet_template.xlsx",
+                   sheet = "Basespace",
+                   date = "2019-06-18",
+                   species = "Homo sapiens",
+                   investigator = "Darryl Abbott")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200602_SCRIPT_batch2_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200602_SCRIPT_batch3_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190618_NB501488_0296_AHHKCKBGXB_copy_RAG/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 4
+Generate SampleSheet   
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200512_NB501488_0354_AHW225BGXF_copy_RAG/batch04_sample_sheet_template.xlsx",
+                   sheet = "Basespace",
+                   date = "2020-05-12",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200602_SCRIPT_batch4_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200602_SCRIPT_batch4_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200512_NB501488_0354_AHW225BGXF_copy_RAG/
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 8   
+Generate SampleSheet     
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200603_NB501488_0361_AHJ3HVBGXF/SCRIPT batch 8 SMART Stranded Total RNA seq (prepared with batch09).xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-06-03",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200604_SCRIPT_batch8_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200604_SCRIPT_batch8_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200603_NB501488_0361_AHJ3HVBGXF
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 9   
+Generate SampleSheet     
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200604_NB501488_0362_AHJ3T3BGXF/SCRIPT batch 9 SMART Stranded Total RNA seq(prepared with batch08).xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-06-04",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200605_SCRIPT_batch9_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200604_SCRIPT_batch9_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200604_NB501488_0362_AHJ3T3BGXF
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```   
+   
+### Batch 10   
+Generate SampleSheet     
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200716_NB501488_0369_AHVYTYBGXF/SCRIPT batch 10 SMART Stranded Total RNA seq_Hiam.xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-07-16",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200716_SCRIPT_batch10_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200717_SCRIPT_batch10_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200716_NB501488_0369_AHVYTYBGXF
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```    
+   
+### Batch 11   
+Generate SampleSheet     
+```{r}
+clean_sample_sheet(original = "/projects/b1038/Pulmonary/rgrant/script_bulk/200720_NB501488_0370_AHVY5FBGXF/SCRIPT batch 11 SMART Stranded Total RNA seq.xlsx",
+                   sheet = "Basespace ",
+                   date = "2020-07-20",
+                   species = "Homo sapiens",
+                   investigator = "Rogan Grant")
+```   
+   
+BCL2FASTQ   
+~/pioneer_script/rgrant/SCRIPT_bulk_analysis/200720_SCRIPT_batch11_bcl2fastq.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 12:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name="200720_SCRIPT_batch11_bcl2fastq"
+
+module purge
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200720_NB501488_0370_AHVY5FBGXF
+module load bcl2fastq/2.19.1 
+bcl2fastq --loading-threads 4 --writing-threads 4 --processing-threads 4
+```  
+   
+## Run pipe   
+### Batch 5   
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_05/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+GRCh38 alone   
+About the same as below   
+```{bash eval=FALSE}
+screen
+mkdir /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/GRCh38_base_comparison/
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/GRCh38_base_comparison/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--max_time '47.h' \
+--genome 'GRCh38' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch'
+```
+
+   
+GRCh38 + CoV2   
+Max assignment ~ 18%, alignment ~ 70%   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'GRCh38_SARS-CoV-2' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```   
+   
+GRCh38 + CoV2 + IAV H1N1   
+Max assignment ~ 18%, alignment ~ 70%   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```   
+   
+GRCh37 + CoV2 + IAV H1N1   
+Max assignment ~ 60%, alignment ~ 70%. Go with this.   
+```{bash eval=FALSE}
+screen
+mkdir /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/GRCh37_comparison/
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/GRCh37_comparison/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200520_NB501488_0357_AHHVH5BGXF_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```   
+   
+### Batch 1 (complete)     
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190614_NB501488_0294_AHHNVYBGXB_copy_RAG/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/190614_NB501488_0294_AHHNVYBGXB_copy_RAG/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_01/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190614_NB501488_0294_AHHNVYBGXB_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/190614_NB501488_0294_AHHNVYBGXB_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```   
+   
+### Batch 2   
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190617_NB501488_0295_AHHN7WBGXB_copy_RAG/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/190617_NB501488_0295_AHHN7WBGXB_copy_RAG/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_02/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190617_NB501488_0295_AHHN7WBGXB_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/190617_NB501488_0295_AHHN7WBGXB_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 3 (complete)   
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190618_NB501488_0296_AHHKCKBGXB_copy_RAG/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/190618_NB501488_0296_AHHKCKBGXB_copy_RAG/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_03/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/190618_NB501488_0296_AHHKCKBGXB_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/190618_NB501488_0296_AHHKCKBGXB_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 4 (complete)   
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200512_NB501488_0354_AHW225BGXF_copy_RAG/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200512_NB501488_0354_AHW225BGXF_copy_RAG/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_04/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200512_NB501488_0354_AHW225BGXF_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200512_NB501488_0354_AHW225BGXF_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 6   
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_06/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200528_NB501488_0359_AHVYTKBGXF_copy_RAG/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 7   
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/SCRIPT_BATCH_07/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/SCRIPT_BATCH_07/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_07/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/SCRIPT_BATCH_07/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/SCRIPT_BATCH_07/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```    
+   
+### Batch 8  
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200603_NB501488_0361_AHJ3HVBGXF/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200603_NB501488_0361_AHJ3HVBGXF/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_0*/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200603_NB501488_0361_AHJ3HVBGXF/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200603_NB501488_0361_AHJ3HVBGXF/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 9  
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200604_NB501488_0362_AHJ3T3BGXF/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200604_NB501488_0362_AHJ3T3BGXF/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_0*/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200604_NB501488_0362_AHJ3T3BGXF/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200604_NB501488_0362_AHJ3T3BGXF/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 10  
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200716_NB501488_0369_AHVYTYBGXF/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200716_NB501488_0369_AHVYTYBGXF/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_1*/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200716_NB501488_0369_AHVYTYBGXF/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200716_NB501488_0369_AHVYTYBGXF/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
+   
+### Batch 11  
+Organize fastqs   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200720_NB501488_0370_AHVY5FBGXF/
+mkdir fastq
+cd fastq
+fastq_folders=/projects/b1038/Pulmonary/rgrant/script_bulk/200720_NB501488_0370_AHVY5FBGXF/Data/Intensities/BaseCalls/SCRIPT_RNAseq_Batch_1*/RNA*
+
+for folder in $fastq_folders
+do
+  full_path=`realpath ${folder}/*`
+  ln -s $full_path .
+done
+```   
+   
+Run pipe (GRCh37 + CoV2 + IAV H1N1)   
+```{bash eval=FALSE}
+screen
+cd /projects/b1038/Pulmonary/rgrant/script_bulk/200720_NB501488_0370_AHVY5FBGXF/
+module load singularity
+module load graphviz/2.40.1
+
+#hard clipping is really only necessary for paired-end
+nextflow run nf-core/rnaseq \
+-r 1.4.2 \
+--singleEnd \
+--reads '/projects/b1038/Pulmonary/rgrant/script_bulk/200720_NB501488_0370_AHVY5FBGXF/fastq/*.fastq.gz' \
+-profile singularity \
+--reverseStranded \
+--three_prime_clip_r2 3 \
+--email 'rogangrant2022@u.northwestern.edu' \
+--max_memory '100.GB' \
+--max_cpus 24 \
+--igenomes_base '/projects/p30623/reference_genomes/' \
+--max_time '47.h' \
+--genome 'human_viral_pneumonia_GRCh37' \
+--work-dir '/projects/b1042/MisharinLab/rgrant/scratch' \
+--saveUnaligned
+```  
