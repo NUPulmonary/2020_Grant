@@ -7,7 +7,8 @@ output:
 
 # Goals   
 1. Process counts tables generated in 200526_bulk_sequence_processing.Rmd and ensure relatively consistent quality across batches, lack of batch effect. Apply batch correction as necessary.   
-2. Remove problem lanes and samples
+2. Remove problem lanes and samples   
+3. Determine source of poor alignment and assignent, if any   
       
 # Setup   
 ## Load packages   
@@ -24,7 +25,9 @@ library(biomaRt)
 library(patchwork)
 library(gtools)
 library(pheatmap)
+library(RColorBrewer)
 library(parallel)
+library(ggsci)
 cores = 8
 mc = getOption("mc.cores", cores)
 
@@ -35,6 +38,8 @@ options(stringsAsFactors = F)
 human_mart = useMart("ensembl", "hsapiens_gene_ensembl")
 ensembl_conv = getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
                      mart = human_mart)
+
+fig2_pal = pal_npg("nrc")(9)
 
 sessionInfo()
 ```
@@ -138,7 +143,7 @@ mqc_metadata$lane_run = paste(mqc_metadata$Sample, mqc_metadata$batch, sep = "_"
    
 ## Flow data   
 ```{r}
-flow_data = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/2020-10-23_SCRIPT_flow_plus_clinical_metadata_processed.rds") %>% 
+flow_data = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/2020-11-30_SCRIPT_flow_plus_clinical_metadata_processed.rds") %>% 
   dplyr::select(tubeid_macrophRNA, percent_total_CD206_high:percent_others)
 ```
 
@@ -201,7 +206,7 @@ md$sort_dt_cyto = as.Date(md$sort_dt_cyto) #hours are not correct
 
 
 #merge with clinical metadata   
-clinical_md = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/2020-10-23_SCRIPT_clinical_metadata_processed.rds")
+clinical_md = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/2020-11-30_SCRIPT_clinical_metadata_processed.rds")
 md = left_join(md, 
                clinical_md, 
                by = c("tc_pt_study_id"), 
@@ -328,6 +333,7 @@ fit = manova(cbind(md$STAR_mqc_generalstats_star_uniquely_mapped_percent,
              data = md)
 summary.aov(fit)
 ```   
+Hard to differentiate batch and operator, but I had a feeling this would be the case. My numbers are clearly lower. Very interesting that RIN contributes only to mapping, not assignment.      
    
 ## Effect of number of sorted cells   
 ### ANOVA   
@@ -359,6 +365,8 @@ ggplot(md, aes(x = STAR_mqc_generalstats_star_uniquely_mapped_percent,
   geom_point() +
   stat_ellipse()
 ```
+   
+Seems to be pretty variable between batch, with perhaps some influence from operator. I amy be better off preparing fewer plates at a time in the future (4-6 were prepared together). There are a lot of "hidden" variables in each batch, however. Batches 5-7 seem to be of the lowest quality, whereas 3 and 4 are the best by far.  
    
 ## hURNA Correspondence   
 ### Subset   
@@ -440,6 +448,7 @@ ggplot(NULL) +
   geom_point(data = subset(d, highlight), aes(x = PC1, y = PC2, color = sample, shape = is_repeat), alpha = 1, size = 3)
 ```
    
+Personally I vote to include both technical replicates and just collapse them. Given the clear similarity, any difference should be due to non-biological noise. We can always undo this later, but for now I will join them.   
    
 ### Join as technical replicates   
 ```{r}
@@ -665,7 +674,7 @@ ggplot(sex_counts, aes(x = XIST, y = RPS4Y1)) +
 ```
    
 ## Remove bad samples   
-While there is no issue of cross contamination, samples in wells E2-G3 are a duplication of A1-C2. For safety, remove all samples.   
+While there is no issue of cross contamination, samples in wells E2-G3 are a duplication of A1-C2. For safety, dump all of these (and watch over trainees from now on).   
 ```{r}
 discards = c(368522806, 368522800, 368500730,
              368510477, 368522788, 368522813,
@@ -692,14 +701,71 @@ loadings = loadings %>%
   column_to_rownames(var = "id") %>% 
   dplyr::select(PC1:PC10)
 ```   
-PC1 is driven positively by lipid metabolism genes, such as FABP4, many of which are AM markers. Negative loadings may suggest MoAM presence: SPP1 is the first hit. More interesting though: it’s driven most strongly in that direction by Il8 and Il1b https://iai.asm.org/content/80/3/1140.short. PC2 is honestly not that different, but seems to have some proliferation character in the negative direction, homeotstatic MP function in the positive (MERTK, STAB1). Also some inflammatory character: F13A1, CCL2.   
+PC1 is driven positively by lipid metabolism genes, such as FABP4, many of which are AM markers. Negative loadings may suggest MoAM presence: SPP1 is the first hit. More interesting though: it’s driven most strongly in that direction by Il8 and Il1b https://iai.asm.org/content/80/3/1140.short. PC2 is honestly not that different, but seems to have some proliferation character in the negative direction, homeostatic MP function in the positive (MERTK, STAB1). Also some inflammatory character: F13A1, CCL2.   
+   
+## Sample correlelogram   
+### Gather count data   
+```{r}
+counts = counts(script_bulk_samples, normalized = F)
+dim(counts)
+#cutoff will be greater than 1 count for now
+gene_counts = rowSums(counts)
+ggplot(NULL, aes(x = gene_counts)) + 
+  geom_density() +
+  scale_x_log10() +
+  geom_vline(xintercept = 2)
+cutoff = 1
+counts_filtered = counts[rowSums(counts) > cutoff, ]
+dim(counts_filtered)
+```   
+   
+## Perform correlations and plot   
+```{r}
+cors_filtered = cor(counts_filtered)
+annot = colData(script_bulk_samples) %>% 
+  as.data.frame() %>% 
+  dplyr::select(pna_type)
+
+all(rownames(annot) == colnames(cors_filtered)) #true
+
+dists = as.dist(1 - cors_filtered)
+
+pheatmap(mat = cors_filtered, 
+         clustering_method = "ward.D2",
+         annotation_row = annot,
+         annotation_col = annot,
+         clustering_distance_rows = dists,
+         clustering_distance_cols = dists,
+         show_rownames = F,
+         show_colnames = F,
+         annotation_colors = list("pna_type" = c("Healthy Control" = fig2_pal[6],
+                                                 "Non-Pneumonia Control" = fig2_pal[2],
+                                                 "COVID-19" = fig2_pal[1],
+                                                 "Other Viral Pneumonia" = fig2_pal[3],
+                                                 "Other Pneumonia" = fig2_pal[4])))
+```
+   
+## Normal clustering   
+```{r eval=FALSE}
+pheatmap(mat = counts_filtered, 
+         clustering_method = "ward.D2",
+         annotation_col = annot,
+         scale = "row",
+         show_rownames = F,
+         show_colnames = F,
+         annotation_colors = list("pna_type" = c("Healthy Control" = fig2_pal[6],
+                                                 "Non-Pneumonia Control" = fig2_pal[2],
+                                                 "COVID-19" = fig2_pal[1],
+                                                 "Other Viral Pneumonia" = fig2_pal[3],
+                                                 "Other Pneumonia" = fig2_pal[4])))
+```
    
 # Export for high-level analysis   
 ```{r}
-saveRDS(script_bulk, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_script_bulk_des.rds")
-saveRDS(script_bulk_samples, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_script_bulk_des_no_hURNA.rds")
+saveRDS(script_bulk, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_script_bulk_des.rds")
+saveRDS(script_bulk_samples, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_script_bulk_des_no_hURNA.rds")
 ```
       
 # Conclusions   
-1. Although there is some variability in sequencing quality, mapped and assigned reads lead to a very clean dataset with good between-batch correspondence.   
+1. Mapped and assigned reads lead to a very clean dataset with good between-batch correspondence.   
 2. Separation on PCA appears to be driven by real biological phenomena, based on enrichment of macrophage genes in the key PC loadings. Separation may be by AM subtype, expansion, and inflammation.   

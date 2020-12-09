@@ -3,6 +3,9 @@ title: "SARS-CoV-2 Coverage"
 output: html_notebook
 ---
 
+# Goals   
+1. Generate a coverage map of the entire SARS-CoV-2 genome to determine how to best measure replication based on antisense reads, if at all   
+   
 # Setup   
 ## Load packages   
 ```{r setup}

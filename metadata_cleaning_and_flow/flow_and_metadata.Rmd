@@ -5,6 +5,9 @@ output:
     df_print: paged
 ---
 
+## Goals   
+1. Perform differential abundance analysis on all cell populations identified from BAL flow by Sasha to identify cell expansion/depletion associated with COVID-19   
+
 # Setup   
 ## Load packages   
 ```{r setup}
@@ -53,8 +56,8 @@ set.seed(12345)
 
 ## Google login   
 ```{r}
-drive_auth(use_oob = T, cache = T, email = "xxxxxx") # have to run in console :(
-gs4_auth(token = drive_token(), use_oob = T, cache = T, email = "xxxxxx")
+drive_auth(use_oob = T, cache = T, email = "rogangrant2022@u.northwestern.edu") # have to run in console :(
+gs4_auth(token = drive_token(), use_oob = T, cache = T, email = "rogangrant2022@u.northwestern.edu")
 ```
 
 
@@ -91,7 +94,7 @@ flow_data$panel = factor(flow_data$panel)
 
 ## Import RNA extraction metadata   
 ```{r}
-rna_metadata = read_sheet("xxxxxx",
+rna_metadata = read_sheet([redacted],
                           trim_ws = T,
                           .name_repair = "universal", 
                           sheet = "SCRIPT_01 RNAseq Metadata",
@@ -417,7 +420,6 @@ diagnosis = diagnosis %>%
   left_join(., bal_diagnoses) %>% 
   unique()
 
-
 #bind with molecular
 diagnosis = diagnosis %>% 
   mutate(pt_study_id = as.character(pt_study_id)) %>% 
@@ -738,6 +740,20 @@ complete_bal_data = complete_bal_data %>%
 complete_bal_data = complete_bal_data %>% 
   select(-c(clarity_west_mrn, birth_date))
 
+#spot fixes for incorrect entries
+bds_edits = read.csv("~/Box/RGrant/SCRIPT/manuscript_1/201130_missing_metadata_BDS_edits.csv") %>% 
+  dplyr::select(-X)
+for(sample in bds_edits$tc_pt_study_id)
+{
+  #need to exclude NA study IDs or else we also get all of those
+  complete_bal_data$day_of_intubation[complete_bal_data$tc_pt_study_id == sample & !is.na(complete_bal_data$tc_pt_study_id)] =
+    bds_edits$day_of_intubation[bds_edits$tc_pt_study_id == sample]
+  if(is.na(complete_bal_data$age[complete_bal_data$tc_pt_study_id == sample & !is.na(complete_bal_data$tc_pt_study_id)]))
+  {
+    complete_bal_data$age[complete_bal_data$tc_pt_study_id == sample & !is.na(complete_bal_data$tc_pt_study_id)] = 
+      bds_edits$age[bds_edits$tc_pt_study_id == sample]
+  }
+}
 
 #adjust vent days to exclude days when extubated (useful for VAPs)
 complete_bal_data = complete_bal_data %>% 
@@ -748,7 +764,7 @@ complete_bal_data = adjusted$bal
 
 #add superinfection
 complete_bal_data = complete_bal_data %>% 
-  mutate(super_type = case_when(pna_type == "Other Pneumonia" ~ NA_character_,
+  mutate(super_type = case_when(pna_type %in% c("Other Pneumonia", "Non-Pneumonia Control") ~ NA_character_,
                                 (any_nonviral == T & day_of_intubation <= 2 & day_of_intubation >= 0) ~ "Co-Infection",
                                 any_nonviral == T ~ "Superinfection",
                                 is.na(any_nonviral) ~ NA_character_, #this is annoying, but works
@@ -816,14 +832,14 @@ outname = paste0("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/",
                  Sys.Date(),
                  "_",
                  "SCRIPT_clinical_metadata_processed.rds")
-saveRDS(object = script_bal_data,
-        file = outname)
+# saveRDS(object = script_bal_data,
+#         file = outname)
 outname = paste0("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/",
                  Sys.Date(),
                  "_",
                  "SCRIPT_flow_plus_clinical_metadata_processed.rds")
-saveRDS(object = flow_data,
-        file = outname)
+# saveRDS(object = flow_data,
+#         file = outname)
 
 #for subsetting later
 observations = table(flow_data$patient_id)
@@ -867,6 +883,33 @@ if(any(duplicated(script_bal_data$tc_pt_study_id)))
 if(any(duplicated(flow_data$tc_pt_study_id)))
 {
   stop("Duplicated samples: flow")
+}
+
+#ensure no patients switch diagnosis   
+flip_floppers = c()
+for(patient in script_bal_data$study_id)
+{
+  sub = subset(script_bal_data, study_id == patient)
+  if(!all(sub$pna_type == sub$pna_type[1]))
+  {
+    flip_floppers = append(flip_floppers, patient)
+  }
+}
+flip_floppers = unique(flip_floppers)
+if(length(flip_floppers) > 0)
+{
+  stop(paste(length(flip_floppers), "patients change diagnosis"))
+}
+
+if(any(is.na(script_bal_data$day_of_intubation) & script_bal_data$pna_type != "Healthy Control"))
+{
+  
+  stop(paste("Missing intubation days for", sum(is.na(script_bal_data$day_of_intubation)), "samples"))
+}
+if(any(is.na(script_bal_data$age)))
+{
+  
+  stop(paste("Missing ages for", sum(is.na(script_bal_data$age)), "samples"))
 }
 ```
 
@@ -1047,8 +1090,7 @@ By day of BAL
 sampling_dists = script_bal_data %>% 
   dplyr::select(study_id, BAL_order_accession_num, pna_type, day_of_intubation) %>% 
   unique() %>% 
-  dplyr::filter(!is.na(day_of_intubation) & 
-                  is.finite(day_of_intubation) &
+  dplyr::filter(is.finite(day_of_intubation) &
                   !is.na(pna_type))
 #sanity check
 any(!is.na(sampling_dists$BAL_order_accession_num) & duplicated(sampling_dists$BAL_order_accession_num))
@@ -1081,9 +1123,7 @@ ggplot(sampling_dists, aes(x = pna_type, y = day_of_intubation, fill = pna_type)
 sampling_freqs = script_bal_data %>% 
   dplyr::select(study_id, pna_type, day_of_intubation, total_icu_los_days) %>% 
   unique() %>% 
-  dplyr::filter(!is.na(day_of_intubation) & 
-                  is.finite(day_of_intubation) &
-                  !is.na(pna_type) &
+  dplyr::filter(is.finite(day_of_intubation) &
                   !is.na(total_icu_los_days)) %>% 
   group_by(study_id) %>% 
   dplyr::summarize(study_id = first(study_id), #these are all the same type
@@ -1288,8 +1328,8 @@ fig1_data = script_bal_data %>%
                                               yes = NA,
                                               no = `Days of Intubation`)) %>% 
   group_by(study_id) %>% 
-  #at least 3 patients had a birthday in the hospital
-  dplyr::mutate(Age = floor(mean(Age, na.rm = T)),
+  #at least 3 patients had a birthday in the hospital. Take age at admission.
+  dplyr::mutate(Age = floor(min(Age)),
                 `Days of Intubation` = max(`Days of Intubation`, na.rm = T), #not strictly necessary, but removes NA
                 `Length of ICU Stay` = max(`Length of ICU Stay`, na.rm = T)) %>% 
   ungroup() %>% 
@@ -1315,7 +1355,7 @@ fig1_data$Sex = factor(fig1_data$Sex)
 fig1_data$`Smoking Status` = as.character(fig1_data$`Smoking Status`)
 fig1_data$`Smoking Status`[is.na(fig1_data$`Smoking Status`)] = "Unknown or Not Reported"
 fig1_data$`Smoking Status` = factor(fig1_data$`Smoking Status`)
-fig1_data$`Pack Years`[fig1_data$`Pack Years` > 150] = NA
+fig1_data$`Pack Years`[fig1_data$`Pack Years` > 150] = NA 
 #not sure how to handle chronic vent pts
 fig1_data$`Days of Intubation`[is.infinite(fig1_data$`Days of Intubation`)] = NA
 fig1_data$`Length of ICU Stay`[is.infinite(fig1_data$`Length of ICU Stay`)] = NA
@@ -1364,9 +1404,11 @@ ms1_t1_sum
    
 ### Standard table   
 ```{r}
+rm(mean_sd) #otherwise interferes with qwraps2
+
 options(qwraps2_markup = "markdown")
 summary_data = fig1_data %>%
-  dplyr::select(-c(covid_confirmed, `Pack Years`)) %>%
+  dplyr::select(-c(covid_confirmed, `Pack Years`, Outcome)) %>%
   rownames_to_column("study_id") %>% 
   left_join(., ms1_t1) %>% 
   dplyr::select(-c(ir_id)) %>% 
@@ -1468,7 +1510,7 @@ writeLines(
   con = "~/Box/RGrant/SCRIPT/200728_table_2.tex"
 )
 tools::texi2pdf("200728_table_2.tex", clean = TRUE)
-write.csv(all_pathogens_0, "~/Box/RGrant/SCRIPT/200727_pathogens_list.csv")
+write.csv(all_pathogens_0, "~/Box/RGrant/SCRIPT/201130_pathogens_list.csv")
 ```
 
 
@@ -1802,11 +1844,11 @@ demographics_plot = (final_timeline + theme(legend.text = element_text(size = 15
                                             axis.text = element_text(angle = 45, hjust = 1, size = 12),
                                             axis.title.x = element_text(size = 20))
 
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201003_demographics_v4.pdf",
-    width = max_width_nature * 3,
-    height = 15, family = "Arial")
-demographics_plot
-dev.off()
+# CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201003_demographics_v4.pdf",
+#     width = max_width_nature * 3,
+#     height = 15, family = "Arial")
+# demographics_plot
+# dev.off()
 
 demographics_plot
 ```
@@ -2173,19 +2215,13 @@ fig2_heatmap_nolegend = pheatmap(mat = matrix_data,
 ### All days   
 ```{r}
 all_days = flow_data %>% 
-  dplyr::filter(!is.na(day_of_intubation) & !is.na(pna_type)) %>% 
   select(Sample, percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low, 
          percent_monocytes, percent_neutrophils, Diagnosis = pna_type, finite_day_of_intubation,
-         any_nonviral) %>% 
+         Superinfection) %>% 
   arrange(Diagnosis, finite_day_of_intubation) %>% 
   unique()
 annotation_data = all_days %>% 
-  select(Sample, Diagnosis, finite_day_of_intubation, any_nonviral) %>% 
-  dplyr::mutate(Diagnosis = factor(Diagnosis), 
-         Superinfection = factor(ifelse(any_nonviral == TRUE,
-                                        yes = "Superinfection",
-                                        no = "Primary Only"))) %>% 
-  dplyr::select(-any_nonviral) %>% 
+  select(Sample, Diagnosis, finite_day_of_intubation, Superinfection) %>% 
   remove_rownames() %>% 
   column_to_rownames(var = "Sample")
 
@@ -2282,7 +2318,7 @@ patient_pal = sample(colorRampPalette(pal)(length(unique(flow_data$ID))))
 names(patient_pal) = unique(flow_data$ID)
 
 all_days_serial = flow_data %>% 
-  dplyr::filter(!is.na(day_of_intubation) & ID %in% serial_patients) %>% 
+  dplyr::filter(ID %in% serial_patients) %>% 
   select(ID, percent_CD4_total, percent_CD8_total, percent_macs_CD206_high, percent_macs_CD206_low, 
          percent_neutrophils, percent_monocytes, binned_outcome, finite_day_of_intubation, 
          Diagnosis = pna_type, Superinfection, Sample) %>% 
@@ -2377,7 +2413,8 @@ Evertything at once :')
 Early vs late   
 ```{r}
 fig2_data_complete = fig2_data %>% 
-  dplyr::filter(cell_type %in% c("CD4 T", "CD8 T", "Neutrophils")) %>% 
+  dplyr::filter(cell_type %in% c("CD4 T", "CD8 T", "Neutrophils",
+                                 "CD206hi Macrophages", "CD206lo Macrophages")) %>% 
   mutate(Sampling = factor(case_when((day_of_intubation <= 2 & day_of_intubation >= 0) ~ "Early",
                               day_of_intubation > 2 ~ "Late",
                               is.na(day_of_intubation) ~ NA_character_))) %>% #not relevant for these conditions, compare the whole
@@ -2425,9 +2462,9 @@ all_comps = all_comps %>%
   left_join(., start_table) %>% 
   left_join(., end_table) %>% 
   mutate(arbitrary_group = rownames(.),
-         y = c(35, 60, 50, 42.5, 40,
-               50, 60, 50, 105,
-               115))
+         y = c(35, 60, 50, 40, 53, 
+               63, 40, 30, 63, 105, 
+               115, 95, 40, 60))
                          
 
 
@@ -2583,8 +2620,8 @@ all_comps = all_comps %>%
                                      yes = "***"))) %>%
   dplyr::mutate(numeric_annot = format(padj, digits = 2, scientific = T)) %>%
   dplyr::mutate(arbitrary_group = rownames(.)) %>%
-  dplyr::mutate(y = c(52, 62, 45, 55, 110,
-                      105, 120, 65, 75)) #had to just do this manually
+  dplyr::mutate(y = c(52, 62, 45, 55, 65, 
+                      120, 95, 65, 80, 95)) #had to just do this manually
 
 combined_plot_D0 = ggplot(fig2_data_0, aes(x = Diagnosis, y = value, fill = Diagnosis)) +
   geom_boxplot(width = 0.5, outlier.shape = NA) +
@@ -2735,7 +2772,7 @@ ggplot(fig2_tcells, aes(x = binned_outcome, y = value, fill = binned_outcome)) +
 Overall, seems like recruitment of T cells leads to positive outcomes, but only if this is either short-lived or occurs early in infection. Fits well with the current model.   
    
 Superinfection and neutrophils (now + T cells)      
-```{r}
+```{r eval=FALSE}
 fig2_neutrophils_super = flow_data_long %>% 
   dplyr::filter(!is.na(pna_type) & 
                   flow_parameter == "percent_neutrophils" &
@@ -2878,7 +2915,7 @@ covid_neutrophil_plot
 ```
    
 COVID only, after initial   
-```{r}
+```{r eval=FALSE}
 covid_only_on_intake = fig2_neutrophils_super %>% 
   dplyr::select(ID, day_of_intubation, Superinfection, covid_confirmed) %>% 
   dplyr::filter(covid_confirmed == T & day_of_intubation >=0 & day_of_intubation <= 2) %>% 
@@ -3003,12 +3040,12 @@ flow_plot_fig2 = fig2_heatmap_gg +
    plot_annotation(tag_levels = 'a') & 
                      theme(plot.tag = element_text(size = 20, family = "Arial"))
 
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201013_flow_plot_D0.pdf",
-    width = max_width_nature * 3,
-    height = max_height_nature, 
-    family = "Arial")
-flow_plot_fig2
-dev.off()
+# CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201129_flow_plot_D0.pdf",
+#     width = max_width_nature * 3,
+#     height = max_height_nature, 
+#     family = "Arial")
+# flow_plot_fig2
+# dev.off()
 
 
 fig2_heatmap_nolegend_gg = as.ggplot(fig2_heatmap_nolegend, scale = 0.98)
@@ -3018,12 +3055,12 @@ flow_plot_fig2_nogelend = fig2_heatmap_nolegend_gg +
    plot_annotation(tag_levels = 'a') & 
                      theme(plot.tag = element_text(size = 20, family = "Arial"))
 
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201013_flow_plot_nolegend_D0.pdf",
-    width = max_width_nature * 3,
-    height = max_height_nature, 
-    family = "Arial")
-flow_plot_fig2_nogelend
-dev.off()
+# CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201129_flow_plot_nolegend_D0.pdf",
+#     width = max_width_nature * 3,
+#     height = max_height_nature, 
+#     family = "Arial")
+# flow_plot_fig2_nogelend
+# dev.off()
 
 flow_plot_fig2_nogelend
 ```
@@ -3170,7 +3207,7 @@ all_comps = bind_rows(comps) %>%
   dplyr::mutate(padj = p.adjust(pval, method = "fdr")) %>% 
   dplyr::filter(padj < 0.05) %>% 
   dplyr::mutate(annot = format(padj, digits = 2, scientific = T)) %>% 
-  mutate(y = c(500, 1000, 50000, 1800, 900),
+  mutate(y = c(50, 60, 1000, 2000),
          y_log10 = log10(y))
                         
 
@@ -3473,17 +3510,6 @@ biomarker_plot_d0 = ggplot(biomarker_d0, aes(x = Diagnosis, y = value, fill = Di
               aes(xmin = comp1, xmax = comp2, annotations = annot, y_position = y),
               tip_length = 0,
               manual=TRUE)
-
-
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/200705_biomarkers_d0_v2.pdf",
-    width = max_width_nature * 4,
-    height = 25, 
-    family = "Arial")
-biomarker_plot_d0
-dev.off()
-
-
-biomarker_plot_d0
 ```   
   
 ### Compare CRP against "normal" range   
@@ -3544,10 +3570,7 @@ biomarker_plot
 By sample   
 ```{r}
 bulk_md = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/201023_bulk_md_for_counting.csv")
-sc_samples = c("1235-BAL-00", "1236-BAL-00", "1239-BAL-00", 
-               "1240-BAL-00", "1241-BAL-00", "1246-BAL-00",
-               "1252-BAL-00", "1254-BAL-00", "1266-BAL-00",
-               "1300-BAL-00", "1313-BAL-00", "1317-BAL-00")
+sc_samples = [redacted]
 
 #track each sample across analysis process
 alluvial_data_samples =  script_bal_data %>% 
@@ -3579,15 +3602,7 @@ missing_indices = c(unique(alluvial_data_samples$sample_index[alluvial_data_samp
                     unique(alluvial_data_samples$sample_index[alluvial_data_samples$tc_pt_study_id == "1241-BAL-00"]),
                     unique(alluvial_data_samples$sample_index[alluvial_data_samples$tc_pt_study_id == "1254-BAL-00"]))
                     
-missing_samples_na = rbind(missing_samples_na,
-                             data.frame(sample_index = missing_indices,
-                                        study_id = c(1252, 1240, 1240, 1266, 1239, 1241, 1254),
-                                        tc_pt_study_id = c("1252-BAL-00", "1240-BAL-00", "1240-BAL-00", "1266-BAL-00",
-                                                           "1239-BAL-00", "1241-BAL-00", "1254-BAL-00"),
-                                        Diagnosis = rep("NA", 7),
-                                        day_of_intubation = rep(NA, 7),
-                                        Analysis = c("Flow Cytometry", "Flow Cytometry", "Bulk RNA-seq", "Bulk RNA-seq", 
-                                                     "Flow Cytometry", "Flow Cytometry", "Flow Cytometry")))
+missing_samples_na = [redacted]
 alluvial_data_samples = rbind(alluvial_data_samples,
                               missing_samples_na)
 alluvial_data_samples$Diagnosis = factor(alluvial_data_samples$Diagnosis,
@@ -3724,12 +3739,12 @@ figure_s1 = ((alluvial_patient | (alluvial_sample + theme(legend.position = "bot
         axis.title.x = element_text(size = 22.5),
         legend.text = element_text(size = 22.5))
 
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201023_figure_S1.pdf",
-    width = max_width_nature * 5,
-    height = max_height_nature * 5, 
-    family = "Arial")
-figure_s1
-dev.off()  
+# CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201129_figure_S1.pdf",
+#     width = max_width_nature * 5,
+#     height = max_height_nature * 5, 
+#     family = "Arial")
+# figure_s1
+# dev.off()  
 ```
 
 # Figure 4 (flow portion)      
@@ -3744,12 +3759,12 @@ flow_plot_fig5 = fig4_serial_heatmap_gg_clustered +
     plot_layout(design = layout) +
     plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 20, family = "Arial"))
 
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201018_fig4_rough_local.pdf",
-    width = max_width_nature * 3,
-    height = max_height_nature, 
-    family = "Arial")
-flow_plot_fig5
-dev.off()
+# CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201129_fig4_rough_local.pdf",
+#     width = max_width_nature * 3,
+#     height = max_height_nature * 1.5, 
+#     family = "Arial")
+# flow_plot_fig5
+# dev.off()
 ```
 
 # Final summaries   
@@ -3807,11 +3822,11 @@ bulk_plot_S3 = all_unclustered_nolegend_gg +
   plot_layout(design = layout) +
   plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 20, family = "Arial"))
 
-CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201021_figS3_top_local.pdf",
-    width = max_width_nature * 4,
-    height = max_height_nature * 1.5, family = "Arial")
-bulk_plot_S3
-dev.off()
+# CairoPDF("~/Box/RGrant/SCRIPT/manuscript_1/201129_figS3_top_local.pdf",
+#     width = max_width_nature * 4,
+#     height = max_height_nature * 1.5, family = "Arial")
+# bulk_plot_S3
+# dev.off()
 ```
    
 # Data export   
@@ -3855,4 +3870,3 @@ flow_data_export = script_bal_data %>%
   dplyr::filter(!is.na(percent_macs_CD206_high) | !is.na(scRNAseq_id) | !is.na(bulk_RNAseq_sample)) 
 write.csv(flow_data_export, "~/Box/RGrant/SCRIPT/manuscript_1/2010245_flow_bulk_and_sc_data.csv")
 ```
-

@@ -3,6 +3,10 @@ title: "SCRIPT Bulk High-Level Analysis"
 output: html_notebook
 ---
 
+# Goals   
+1. Identify transcriptional patterns in AM associated with IAV, COVID-19, and common to both   
+2. Determine source of IL6 and IL1B in the lung (if possible)   
+   
 # Setup   
 ## Load packages   
 ```{r setup}
@@ -47,7 +51,7 @@ sessionInfo()
 
 ## Import data   
 ```{r}
-mp = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_script_bulk_des_no_hURNA.rds")
+mp = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_script_bulk_des_no_hURNA.rds")
 mp$covid_confirmed = factor(mp$covid_confirmed)
 mp$sex = factor(mp$gender)
 
@@ -458,7 +462,7 @@ time_cor = cor.test(covid_counts_binarized$all_viral_counts, covid_counts_binari
 time_cor_rho = round(time_cor$estimate, digits = 2)
 
 sars_time_cor = ggplot(covid_counts_binarized, aes(x = day_of_intubation, y = (all_viral_counts + 0.5))) +
-  geom_point() +
+  geom_jitter() +
   scale_y_continuous(trans = "log10") +
   xlab("Day of Mechanical Ventilation") +
   ylab("SARS-CoV-2 Counts") +
@@ -468,47 +472,6 @@ sars_time_cor = ggplot(covid_counts_binarized, aes(x = day_of_intubation, y = (a
   annotate(x = 30, y = 5e4, label = paste("ρ = ", time_cor_rho), size = 6, geom = "text")
 sars_time_cor
 ```
-      
-## Which samples are worth sequencing further?   
-### First batch   
-```{r eval=FALSE}
-good_samples = mp_des[, ((!is.na(mp_des$RIN) & mp_des$RIN >= 7) & 
-                    mp_des$STAR_mqc_generalstats_star_uniquely_mapped_percent >= 30 &
-                    mp_des$featureCounts_mqc_generalstats_featurecounts_percent_assigned >= 30) &
-                    mp_des$RNA_concentration_pg_ul >= 125 |
-                    (mp_des$iav_h1n1_detected == TRUE | mp_des$sars_cov2_detected == TRUE)]
-
-selection_data = as.data.frame(colData(good_samples)) %>% 
-  dplyr::select(sample, tc_pt_study_id, RIN, STAR_mqc_generalstats_star_uniquely_mapped_percent,
-         featureCounts_mqc_generalstats_featurecounts_percent_assigned, iav_h1n1_detected, 
-         sars_cov2_detected, covid_confirmed, batch, RNA_concentration_pg_ul, pna_type)
-selection_data
-```   
-Keepers:   
-- 340224808 (IAV)
-- 304017553 (IAV + likely another coronavirus)
-- 340239805 (Cov2)
-- 340233896 (Cov2)
-- 340239790 (Cov2)
-- 340239789 (Cov2)
-- 304012699 (Other -- likely another coronavirus)
-- 300312389 (other)
-- 304020362 (other)
-   
-```{r eval=FALSE}
-keepers = selection_data %>% 
-  dplyr::filter(sample %in% c(304020298, 340224808, 304017553, 340239805, 340233896,
-                              340239790, 340239789, 304012699, 300312389, 304020362)) %>% 
-  mutate(vol_for_250_pg = round(250 / RNA_concentration_pg_ul, digits = 3))
-keepers$dilution = ifelse(keepers$vol_for_250_pg > 0.5,
-                          yes = 1,
-                          no = ifelse(keepers$vol_for_250_pg > 0.1,
-                                      yes = 5,
-                                      no = 20))
-keepers$dilution_vol_for_250_pg = round(250 / (keepers$RNA_concentration_pg_ul / keepers$dilution), digits = 3)
-write.csv(keepers, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200612_resequencing_samples.csv")
-keepers
-```   
    
 # Signatures associated with SARS-CoV-2   
 ## Single genes   
@@ -674,7 +637,7 @@ cov2_kmeans_noclustering = k_means_figure(dge = mp_des,
                                                       finite_day_of_intubation =  intubation_pal,
                                                       Superinfection = c("Superinfection" = fig2_pal[9],
                                                                          "Primary Only" = fig2_pal[7])), 
-                             custom_order = c(3, 1, 4, 2, 5), 
+                             custom_order = c(5, 1, 4, 3, 2), 
                              sortColumns = T,
                              column_sort_factors = c("Diagnosis", "finite_day_of_intubation"))
 
@@ -703,7 +666,7 @@ cov2_kmeans_clustered = k_means_figure(dge = mp_des,
                                                       finite_day_of_intubation =  intubation_pal,
                                                       Superinfection = c("Superinfection" = fig2_pal[9],
                                                                          "Primary Only" = fig2_pal[7])), 
-                             custom_order = c(3, 1, 4, 2, 5))
+                             custom_order = c(5, 1, 4, 3, 2))
 for(i in 1:length(cov2_kmeans_clustered$GO))
 {
   cov2_kmeans_clustered$GO[[i]]$cluster = i
@@ -715,10 +678,10 @@ cov2_kmeans_clustered$expression = counts(mp_des, normalized = T) %>%
   rownames_to_column("ensembl_gene_id") %>% 
   dplyr::filter(ensembl_gene_id %in% cov2_kmeans_clustered$genes$gene) %>% 
   right_join(gene_conv, .)
-saveRDS(cov2_kmeans_clustered, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_clustered.rds")
-saveRDS(cov2_kmeans_noclustering, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_unclustered.rds")
-write.csv(cov2_kmeans_clustered$genes, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_genes.csv")
-write.csv(cov2_kmeans_clustered$go_df, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_GO.csv")
+saveRDS(cov2_kmeans_clustered, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_clustered.rds")
+saveRDS(cov2_kmeans_noclustering, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_unclustered.rds")
+write.csv(cov2_kmeans_clustered$genes, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_genes.csv")
+write.csv(cov2_kmeans_clustered$go_df, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_GO.csv")
 ```   
    
 This is actually very cool (and nicely foreshadows the later WGCNA results). C1: mostly COVID-related(!); highly enriched for type I interferon response (not production so much), as well as MHC-I. C2: mostly nonviral pneumonias. Pretty classic STAT3 inflammatory response. 
@@ -755,7 +718,7 @@ kmeans_d0 = k_means_figure(dge = mp_des_0,
                                                                     "Other_Pneumonia" = fig2_pal[4]),
                                                       super_type = c("Co-Infection" = fig2_pal[9],
                                                                          "Primary Only" = fig2_pal[7])), 
-                           custom_order = c(4, 5, 2, 1, 3))
+                           custom_order = c(5, 4, 2, 1, 3))
 for(i in 1:length(kmeans_d0$GO))
 {
   kmeans_d0$GO[[i]]$cluster = i
@@ -767,9 +730,9 @@ kmeans_d0$expression = counts(mp_des, normalized = T) %>%
   rownames_to_column("ensembl_gene_id") %>% 
   dplyr::filter(ensembl_gene_id %in% kmeans_d0$genes$gene) %>% 
   right_join(gene_conv, .)
-saveRDS(kmeans_d0, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_d0.rds")
-write.csv(kmeans_d0$genes, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_d0_genes.csv")
-write.csv(kmeans_d0$go_df, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_d0_GO.csv")
+saveRDS(kmeans_d0, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_d0.rds")
+write.csv(kmeans_d0$genes, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_d0_genes.csv")
+write.csv(kmeans_d0$go_df, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_d0_GO.csv")
 ```   
    
 ## Individual genes 
@@ -1112,7 +1075,7 @@ plot(sft$fitIndices[,1],
      main = paste("Mean connectivity"))
 text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
 ```   
-7 looks like the intersection after adding healthy controls, removing bad samples   
+7 looks like the intersection after adding healthy controls, removing bad samples. Still true as of 2020-11-30.   
    
 ## Co-expression by similarity and adjacency   
 ```{r}
@@ -1400,14 +1363,17 @@ saveRDS(module_cor_heatmap_vent, "/projects/b1038/Pulmonary/rgrant/script_bulk/A
    
 ### Sanity check: are the CD206 modules TRAM/MoAM markers?   
 ```{r}
+module_names = data.frame(color = gsub("ME", "", colnames(MEs)),
+                          module_name = paste0("Module ", 1:ncol(MEs)))
 module_assignments = data.frame(ensembl_gene_id = colnames(all_counts),
-                                module = factor(mergedColors)) %>% 
-  left_join(., gene_conv)
+                                color = factor(mergedColors)) %>% 
+  left_join(., gene_conv) %>% 
+  left_join(module_names)
 write.csv(module_assignments,
           "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201022_WGCNA_module_assignments.csv")
 
-cd206_correlated = subset(module_assignments, module == "brown")
-cd206_anticorrelated = subset(module_assignments, module == "turquoise")
+cd206_correlated = subset(module_assignments, color =="brown")
+cd206_anticorrelated = subset(module_assignments, color =="turquoise")
 cd206_correlated
 cd206_anticorrelated
 ```
@@ -1417,7 +1383,7 @@ Pretty ideal, yeah
 ### COVID-associated   
 Tan contains all of the CoV-2 genes!   
 ```{r}
-covid_correlated_cd206_uncorrelated = subset(module_assignments, module == "tan")
+covid_correlated_cd206_uncorrelated = subset(module_assignments, color =="tan")
 covid_correlated_cd206_uncorrelated
 write.csv(covid_correlated_cd206_uncorrelated,
           "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201022_tan_module_15_genes.csv")
@@ -1473,7 +1439,7 @@ total_umap = MEList$averageExpr %>%
   left_join(total_umap, .)
 covid_umap = total_umap %>% 
   dplyr::filter(covid_confirmed == TRUE)
-saveRDS(covid_umap, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_covid_umap.rds")
+saveRDS(covid_umap, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_covid_umap.rds")
 
 ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEtan, color = Diagnosis)) +
   geom_point()
@@ -1483,7 +1449,7 @@ module15_umap = ggplot(total_umap, aes(x = UMAP_1, y = UMAP_2, size = AEtan, col
   theme(text = element_text(family = "Arial"),
         legend.position = "bottom")  +
   scale_color_manual(name = "Diagnosis",
-                    values = c("Healthy_Control" = fig2_pal[6],
+                    values = c("Healthy Control" = fig2_pal[6],
                                "Non-Pneumonia Control" = fig2_pal[2],
                                "COVID-19" = fig2_pal[1],
                                "Other Viral Pneumonia" = fig2_pal[3],
@@ -1692,35 +1658,7 @@ ggplot(covid_umap, aes(x = finite_day_of_intubation, y = general_IFN_response)) 
   ylab("Average IFN response Expression") +
   xlab("Day of Mechanical Ventilation")
 ```   
-
-
    
-# Second batch of pico optimization   
-Let's focus on interferon-hi vs interferon-low samples   
-### Identify interesting   
-```{r eval=FALSE}
-last_batch = c(300312389, 304012699, 304017553, 304020298, 304020362,
-               340224808, 340233896, 340239789, 340239790, 340239805)
-good_samples = mp_des[, ((!is.na(mp_des$RIN) & mp_des$RIN >= 7) & 
-                    mp_des$STAR_mqc_generalstats_star_uniquely_mapped_percent >= 30 &
-                    mp_des$featureCounts_mqc_generalstats_featurecounts_percent_assigned >= 30) &
-                    mp_des$RNA_concentration_pg_ul >= 125]
-remaining_interesting = setdiff(good_samples$sample, last_batch)
-interesting_metadata = subset(total_umap, sample %in% remaining_interesting)
-table(interesting_metadata$pna_type)
-ggplot(interesting_metadata, aes(x = pna_type, y = AEtan)) +
-  geom_boxplot()
-selection = interesting_metadata %>% 
-  filter(pna_type != "Other Pneumonia" | sample == 340235110) %>% 
-  dplyr::select(sample, tube_loc_macrophRNA_boxID, RNA_concentration_pg_ul) %>% 
-  mutate(dilution = ifelse((250 / RNA_concentration_pg_ul) < 0.4,
-                           yes = round(1 / (250 / RNA_concentration_pg_ul) / 5) * 5,
-                           no = 1)) %>% 
-  mutate(vol_for_250_pg = round(250 / RNA_concentration_pg_ul * dilution, digits = 2))
-write.csv(selection, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200713_pico_opt_batch2.csv")
-selection
-```   
-
 # Conclusions   
 ## Output data for posterity   
 ```{r eval=FALSE}
@@ -1740,8 +1678,8 @@ final_md_safe = colData(mp_des) %>%
                 days_from_first_intubation = day_of_intubation, scRNAseq_id,
                 superinfection = Superinfection)
 
-write.csv(final_counts_raw, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201023_raw_counts_geo.csv")
-write.csv(final_md_safe, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201023_deidentified_metadata_geo.csv")
+write.csv(final_counts_raw, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201130_raw_counts_geo.csv")
+write.csv(final_md_safe, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201130_deidentified_metadata_geo.csv")
 ```
    
 ## Export supplemental files   
@@ -1760,7 +1698,7 @@ dea_hits = lapply(all_comparisons, function(x){
     arrange(padj)
   return(hits)})
 names(dea_hits) = names(all_comparisons)
-saveRDS(dea_hits, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201023_bulk_dea_complete.rds")
+saveRDS(dea_hits, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201130_bulk_dea_complete.rds")
 ```
    
 ### Export as single excel file   
@@ -1773,11 +1711,13 @@ names(dea_hits) = gsub("Other_Viral_Pneumonia", "OVP", names(dea_hits))
 names(dea_hits) = gsub("Other_Pneumonia", "OP", names(dea_hits))
 names(dea_hits) = gsub("Non_Pneumonia_Control", "NPC", names(dea_hits))
 names(dea_hits) = gsub("COVID_19", "COVID-19", names(dea_hits))
+
 all_sheets = c(list("k-means genes" = output_genes,
-                    "k-means GO enrichment" = cov2_kmeans_clustered$go_df),
+                    "k-means GO enrichment" = cov2_kmeans_clustered$go_df,
+                    "WGCNA module assignments" = module_assignments),
                dea_hits)
 write.xlsx(x = all_sheets,
-           file = "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_bulk_supplmental_data.xlsx")
+           file = "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_bulk_supplmental_data.xlsx")
 ```
    
 ## Assemble figures   
@@ -1786,8 +1726,8 @@ write.xlsx(x = all_sheets,
 max_width_nature = 7.20472 #inches
 max_height_nature = 9.72441
 
-dea_hits = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201023_bulk_dea_complete.rds")
-d0_hm_gg = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_d0.rds")$plot %>% 
+dea_hits = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201130_bulk_dea_complete.rds")
+d0_hm_gg = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_d0.rds")$plot %>% 
   as.ggplot()
 viral_expression_heatmap_early_gg = as.ggplot(viral_expression_heatmap_early)
 
@@ -1798,7 +1738,7 @@ bulk_plot_fig3 = d0_hm_gg +
     plot_annotation(tag_levels = 'a') & theme(text = element_text(family = "Arial"),
                                               plot.tag = element_text(size = 20, family = "Arial"))
 
-CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_fig3_rough.pdf",
+CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_fig3_rough.pdf",
     width = max_width_nature * 2,
     height = max_height_nature * 2, 
     family = "Arial")
@@ -1907,7 +1847,7 @@ marker_gene_plot
    
 ### Figure S3   
 ```{r}
-cov2_kmeans_noclustering = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_unclustered.rds")
+cov2_kmeans_noclustering = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_unclustered.rds")
 #coverage_plot = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/200803_cov2_coverage_plot.rds")
 figS3_heatmap = cov2_kmeans_noclustering$plot
 figS3_heatmap_gg = as.ggplot(figS3_heatmap)
@@ -1930,7 +1870,7 @@ bulk_plot_S3 = figS3_heatmap_gg +
     plot_layout(design = layout) +
     plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 30, family = "Arial"))
 
-CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_figS3_bottom_quest.pdf",
+CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_figS3_bottom_quest.pdf",
     width = max_width_nature * 4,
     height = max_height_nature * 2.5, family = "Arial")
 bulk_plot_S3
@@ -1939,15 +1879,15 @@ dev.off()
 bulk_plot_S3
 ```
    
-   
+### Export metadata for internal use   
 ```{r}
 md = as.data.frame(colData(mp_des))
 col_types = unlist(lapply(md, class))
 list_cols = names(col_types[col_types == "AsIs"])
-safe_md = md %>% 
+csv_safe_md = md %>% 
   dplyr::select(-c(all_of(list_cols))) %>% 
   as.data.frame()
-write.csv(safe_md, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201002_bulk_mp_metadata.csv")
+write.csv(csv_safe_md, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_bulk_mp_metadata.csv")
 ```
    
 # Individual patient trajectories   
@@ -2002,8 +1942,8 @@ genes_anno = tibble(ensembl_gene_id = rownames(serial_counts_mat)) %>%
    left_join(., gene_conv) %>% 
    column_to_rownames("ensembl_gene_id")
 
-safe_md = read.csv("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201023_deidentified_metadata_geo.csv") %>% 
-   dplyr::select(sample, anonymized_patient_id)
+safe_md = read.csv("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/GEO_output/201130_deidentified_metadata_geo.csv") %>% 
+   dplyr::select(sample, anonymized_patient_id = patient_id)
 serial_counts_anno = serial_counts %>% 
    left_join(., safe_md) %>% 
    dplyr::select(sample, anonymized_patient_id, day_of_intubation, 
@@ -2041,7 +1981,7 @@ progression_hm = pheatmap(mat = serial_counts_mat,
 ### Select just "core" interferon genes in the module and repeat   
 ```{r}
 covid_ifn_genes = module_assignments %>% 
-  dplyr::filter(module == "tan" & 
+  dplyr::filter(color =="tan" & 
                   grepl("IRF\\d+|IFI\\d+|IFIT\\d+|IFITM\\d+|ISG\\d+|OAS\\d+|MX\\d+", gene_name))
 
 #as before
@@ -2085,7 +2025,7 @@ progression_hm = pheatmap(mat = ifn_hm_mat,
          border_color = NA,
          color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101))
 
-saveRDS(progression_hm, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_patient_progression_heatmap.rds")
+saveRDS(progression_hm, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_patient_progression_heatmap.rds")
 ```
 
    
@@ -2224,7 +2164,7 @@ infection_results = results(infection_des, c("cov2_infection", "sars_cov2_detect
 
 hits = rownames(infection_results)[!is.na(infection_results$padj) & infection_results$padj < 0.05]
 
-goi = c(subset(module_assignments, module == "tan" & ensembl_gene_id %in% hits)$gene_name, cov2_genes$gene_name) %>% 
+goi = c(subset(module_assignments, color =="tan" & ensembl_gene_id %in% hits)$gene_name, cov2_genes$gene_name) %>% 
   unique()
 gene_conv_formatted = gene_conv %>% 
   dplyr::rename(external_gene_name = gene_name)
@@ -2246,7 +2186,7 @@ infection_type_results = results(infection_des, c("infection_detected", "sars_co
 
 hits = rownames(infection_type_results)[!is.na(infection_type_results$padj) & infection_type_results$padj < 0.05]
 
-goi = c(subset(module_assignments, module == "tan" & ensembl_gene_id %in% hits)$gene_name, non_human_genes$gene_name) %>% 
+goi = c(subset(module_assignments, color =="tan" & ensembl_gene_id %in% hits)$gene_name, non_human_genes$gene_name) %>% 
   unique()
 infection_type_ma = pretty_MA_plot(infection_type_results, custom_annotation = gene_conv_formatted, genes = goi)
 infection_type_ma = infection_type_ma +
@@ -2256,108 +2196,26 @@ infection_type_ma = infection_type_ma +
 infection_type_ma
 ```
 
-# Sharing   
-## Clarissa
-```{r}
-iav_counts = counts(mp_des, normalized = T)[iav_genes$ensembl_gene_id, ]
-mp_des$iav_counts = colSums(iav_counts)
-mp_des$antisense_detected = antisense_counts > 0
-
-md = colData(mp_des) %>% 
-  as.data.frame()
-
-cov2_hi = md %>% 
-  dplyr::filter(replicating == "replication_detected" & covid_confirmed == T) %>% 
-  arrange(desc(cov2_counts)) %>% 
-  dplyr::select(sample, cov2_counts) %>% 
-  dplyr::slice(1:3) %>% 
-  .$sample
-
-iav_detection = md %>% 
-  dplyr::filter(iav_h1n1_detected == T & any_iav == T) %>% 
-  arrange(desc(iav_counts)) %>% 
-  dplyr::select(sample, iav_counts) %>% 
-  dplyr::slice(1:2) %>% #only 2 strong ones
-  .$sample
-
-only_antisense = md %>% 
-  dplyr::filter(antisense_detected == T & covid_confirmed == T) %>% 
-  arrange(cov2_counts) %>% 
-  dplyr::select(sample, cov2_counts) %>% 
-  dplyr::slice(1:3) %>% 
-  .$sample
-
-healthy_controls = md %>% 
-  dplyr::filter(pna_type == "Healthy Control" & cov2_counts == 0) %>% 
-  dplyr::slice(1:3) %>% 
-  .$sample
-
-to_share = c(cov2_hi, iav_detection, only_antisense, healthy_controls)
-to_share_regex = paste(to_share, collapse = "|")
-
-#find sample locations
-seq_dirs = list.dirs("/projects/b1038/Pulmonary/rgrant/script_bulk",
-                     full.names = T, 
-                     recursive = F)
-seq_dirs = seq_dirs[grepl("^/projects/b1038/Pulmonary/rgrant/script_bulk/\\d{6}_|SCRIPT_BATCH_07", seq_dirs)]
-fastqs = lapply(seq_dirs, function(x){
-  fastq_syms = list.files(paste0(x, "/fastq"),
-                          pattern = to_share_regex,
-                          full.names = T)
-  #get real locations
-  real_paths = Sys.readlink(fastq_syms)
-  return(real_paths) })
-fastqs = unlist(fastqs)
-
-#copy to a new folder
-# dir.create("/projects/b1038/Pulmonary/rgrant/script_bulk/data_for_clarissa")
-# file.copy(from = fastqs,
-#           to = "/projects/b1038/Pulmonary/rgrant/script_bulk/data_for_clarissa",
-#           copy.date = T, 
-#           overwrite = F)
-# copy over metadata
-# clarissa_md = md %>%
-#   dplyr::filter(sample %in% to_share) %>%
-#   dplyr::select(sample, covid_confirmed,
-#                 replicating, cov2_counts,
-#                 antisense_detected, iav_h1n1_detected,
-#                 any_iav, iav_counts,
-#                 pna_type)
-# write.csv(clarissa_md, "/projects/b1038/Pulmonary/rgrant/script_bulk/data_for_clarissa/metadata_for_clarissa.csv")
-# our_counts = counts(mp_des, normalized = T)[, rownames(clarissa_md)]
-# write.csv(our_counts, "/projects/b1038/Pulmonary/rgrant/script_bulk/data_for_clarissa/counts_for_clarissa.csv")
-```   
-   
-## Internal   
-```{r}
-saveRDS(mp_des, "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_complete_bulk.rds")
-colData(mp_des) %>% 
-  as_tibble() %>% 
-  dplyr::select(sample, study_id, tc_pt_study_id) %>% 
-  write.csv(., "/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_bulk_md_for_counting.csv")
-```
-
-   
 # Figure 4 (all time-series data)   
 ## Arrange in patchwork   
 ```{r}
-cov2_kmeans_clustered_gg = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_k_means_clustered.rds")$plot %>% 
+cov2_kmeans_clustered_gg = readRDS("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_k_means_clustered.rds")$plot %>% 
   as.ggplot()
 module_cor_heatmap_vent_gg = as.ggplot(module_cor_heatmap_vent)
 
-layout = "AAABBB\nAAABBB\nAAABBB\nAAABBB\nAAABBB\nAAABBB\nAAABBB\nAAABBB\nAAABBB\nCCFFFF\nDDFFFF\nEEFFFF"
+layout = "AAB\nAAB\nAAB\nAAB\nAAB\nCCD\nCCE\nCCF"
 fig4 = cov2_kmeans_clustered_gg +
+  plot_spacer() +
   module_cor_heatmap_vent_gg +
   (typei_corplot + ylab("")) +
   (typeii_corplot + ylab("Average Expression")) +
   (module_15_corplot + ylab("") + xlab("Days from First Intubation")) +
-  covid_progressions +
     plot_layout(design = layout) +
     plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 20, family = "Arial"))
 
-CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_fig4_rough_quest.pdf",
-    width = max_width_nature * 3,
-    height = max_height_nature * 1.5, family = "Arial")
+CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_fig4_rough_quest.pdf",
+    width = max_width_nature * 2,
+    height = max_height_nature * 2, family = "Arial")
 fig4
 dev.off()
 
@@ -2365,13 +2223,12 @@ layout = "ADD\nBDD\nCDD"
 fig4_bottom = (typei_corplot + ylab("")) +
   (typeii_corplot + ylab("Average Expression")) +
   (module_15_corplot + ylab("") + xlab("Days from First Intubation")) +
-  covid_progressions +
+  progression_hm_ggplot +
     plot_layout(design = layout) +
     plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 20, family = "Arial"))
-CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201023_fig4_bottom_quest.pdf",
+CairoPDF("/projects/b1038/Pulmonary/rgrant/script_bulk/Analysis/201130_fig4_bottom_quest.pdf",
     width = max_width_nature * 3,
     height = max_height_nature * 0.75, family = "Arial")
 fig4_bottom
 dev.off()
 ```
-
