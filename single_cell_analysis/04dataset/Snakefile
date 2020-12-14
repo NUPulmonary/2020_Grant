@@ -1,0 +1,220 @@
+import os
+import sys
+sys.path.insert(0, "../lib")
+import pandas as pd
+
+import integrate
+import run_scrublet
+import plot_coverage
+
+
+R_OPTS = "--no-site-file --no-environ --no-restore"
+
+SAMPLES = pd.read_csv("samples.csv")
+SAMPLE_DIR = "../data"
+
+# H5 files are named like this
+# GSM4698176_Sample_1_filtered_feature_bc_matrix.h5
+SAMPLE_H5 = pd.Series(sorted(
+    [os.path.join(SAMPLE_DIR, x) for x in os.listdir(SAMPLE_DIR)
+    if "filtered" in x and "_".join(x.split("_")[1:3]) in list(SAMPLES.Sample)]
+))
+DATA_DIR = "../data/04dataset"
+
+
+def input_10x_h5(wildcards):
+    for path in SAMPLE_H5:
+        if wildcards.sample in path:
+            return path
+
+
+rule all:
+    input:
+        expand("{dir}/doublets/{sample}_doublets.csv", dir=DATA_DIR, sample=SAMPLES.Sample),
+        expand("{dir}/fastcar/{sample}", dir=DATA_DIR, sample=SAMPLES.Sample),
+        f"{DATA_DIR}/01obj.h5ad",
+        f"{DATA_DIR}/02obj.h5ad",
+        f"{DATA_DIR}/03obj.h5ad",
+        f"{DATA_DIR}/04obj.h5ad",
+
+
+
+rule scrublet:
+    input: input_10x_h5
+    output:
+        "{dir}/doublets/{sample}_doublets.csv",
+        "{dir}/doublets/{sample}_threshold.txt"
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=20
+    run:
+        run_scrublet.run_scrublet(
+            input[0],
+            save_to=output[0].replace("doublets.csv", "")
+        )
+
+
+rule fastcar:
+    input:
+        input_10x_h5
+    output:
+        directory("{dir}/fastcar/{sample}")
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=40,
+        cutoff="300",
+        prob="0.03"
+    shell:
+        """
+        module purge all
+        module load R/3.6.3
+        module load hdf5/1.8.19-serial
+
+        input=`realpath {input}`
+        input_raw=`echo $input | sed 's/filtered/raw/'`
+        output=`realpath {output}`
+        mkdir -p $output
+
+        cd .. # to pick up project renv
+
+        Rscript {R_OPTS} lib-r/fastcar.R \
+            "$input" \
+            "$input_raw" \
+            "$output" \
+            {params.cutoff} \
+            {params.prob}
+        """
+
+
+rule cellbrowser:
+    input: "{dir}/{ds}.h5ad"
+    output: "{dir}/{ds}-cb.tar.gz"
+    params:
+        slurm__hours=4,
+        slurm__cores=8,
+        slurm__mem=32,
+        noribo = lambda wildcards: wildcards.ds.endswith("-noribo")
+    shell:
+        """
+        h5=`realpath {input}`
+        cd {wildcards.dir}
+
+        fname=`basename {output}`
+        out=${{fname%.tar.gz}}
+        cbImportScanpy -i $h5 -o ${{out}}
+
+        echo "Sedding"
+        sed -i 's/louvain/leiden/g' ${{out}}/cellbrowser.conf
+        sed -i 's/#quickGenesFile/quickGenesFile/' ${{out}}/cellbrowser.conf
+        sed -i 's/#radius=2/radius=2/' ${{out}}/cellbrowser.conf
+        sed -i \
+            "s/enumFields=['leiden']/enumFields=['leiden', 'day', 'replicate', 'patient']/" \
+            ${{out}}/cellbrowser.conf
+
+        echo "Tarring to ${{out}}.tar.gz"
+        tar -czf ${{out}}.tar.gz ${{out}}
+        rm -rf ${{out}}
+        """
+
+
+rule bbknn4:
+    input:
+        "03cells-to-exclude.csv",
+        expand("{dir}/fastcar/{sample}", dir=DATA_DIR, sample=SAMPLES3)
+    output:
+        "{dir}/04{ds}.h5ad",
+        directory("{dir}/04{ds}-data")
+    params:
+        slurm__hours=4,
+        slurm__cores=12,
+        slurm__mem=32,
+        noribo=False
+    run:
+        integrate.integrate(
+            input[1:],
+            output[0],
+            output[1],
+            params.noribo,
+            batch_hvg=True,
+            hvg_genes=4000,
+            hvg_remove="^SARS-CoV-2",
+            neighbors_total=100,
+            cells_remove=input[0]
+        )
+
+
+rule bbknn3:
+    input:
+        "02cells-to-exclude.csv",
+        expand("{dir}/fastcar/{sample}", dir=DATA_DIR, sample=SAMPLES3)
+    output:
+        "{dir}/03{ds}.h5ad",
+        directory("{dir}/03{ds}-data")
+    params:
+        slurm__hours=4,
+        slurm__cores=12,
+        slurm__mem=32,
+        noribo=False
+    run:
+        integrate.integrate(
+            input[1:],
+            output[0],
+            output[1],
+            params.noribo,
+            batch_hvg=True,
+            hvg_genes=4000,
+            hvg_remove="^SARS-CoV-2",
+            neighbors_total=100,
+            cells_remove=input[0]
+        )
+
+
+rule bbknn2:
+    input:
+        "01cells-to-exclude.csv",
+        expand("{dir}/fastcar/{sample}", dir=DATA_DIR, sample=SAMPLES.Sample)
+    output:
+        "{dir}/02{ds,\w+}.h5ad",
+        directory("{dir}/02{ds}-data")
+    params:
+        slurm__hours=4,
+        slurm__cores=12,
+        slurm__mem=32,
+        noribo=False
+    run:
+        integrate.integrate(
+            input[1:],
+            output[0],
+            output[1],
+            params.noribo,
+            batch_hvg=True,
+            hvg_genes=4000,
+            hvg_remove="^SARS-CoV-2",
+            neighbors_total=100,
+            cells_remove=input[0]
+        )
+
+
+rule bbknn1:
+    input: SAMPLE_H5
+    output:
+        "{dir}/01{ds,\w+}.h5ad",
+        directory("{dir}/01{ds}-data")
+    params:
+        slurm__hours=4,
+        slurm__cores=12,
+        slurm__mem=32,
+        noribo=False
+    run:
+        integrate.integrate(
+            input,
+            output[0],
+            output[1],
+            params.noribo,
+            batch_hvg=True,
+            hvg_genes=4000,
+            hvg_remove="^SARS-CoV-2",
+            neighbors_total=100,
+        )

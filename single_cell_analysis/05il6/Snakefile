@@ -1,0 +1,71 @@
+import sys
+sys.path.insert(0, "../lib")
+import pandas as pd
+
+
+DATA_DIR = "../data/05il6"
+
+
+rule all:
+    input:
+        f"{DATA_DIR}/habermann/matrix.mtx.gz",
+        f"{DATA_DIR}/habermann/features.tsv.gz",
+        f"{DATA_DIR}/habermann/barcodes.tsv.gz",
+        f"{DATA_DIR}/habermann/metadata.csv",
+
+
+rule get_habermann_mtx:
+    output:
+        "{dir}/habermann/matrix.mtx.gz",
+    params:
+        slurm__skip=True
+    shell:
+        """
+        wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE135893&format=file&file=GSE135893_matrix%2Emtx%2Egz" \
+            -O {output}
+        """
+
+
+rule get_habermann_genes:
+    output:
+        "{dir}/habermann/features.tsv.gz",
+    params:
+        slurm__skip=True
+    shell:
+        """
+        wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE135893&format=file&file=GSE135893_genes%2Etsv%2Egz" \
+            -O {output}
+        # Fix features.tsv.gz to be readable by scanpy
+        gunzip {output}
+        unzipped="{output}"
+        unzipped=${{unzipped%.gz}}
+        sed 's/\(.\+\)/\\1\t\\1\tGene Expression/' $unzipped > $unzipped.2
+        rm $unzipped
+        mv $unzipped.2 $unzipped
+        gzip $unzipped
+        """
+
+
+rule get_habermann_barcodes:
+    output:
+        "{dir}/habermann/barcodes.tsv.gz",
+    params:
+        slurm__skip=True
+    shell:
+        """
+        wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE135893&format=file&file=GSE135893_barcodes%2Etsv%2Egz" \
+            -O {output}
+        """
+
+
+rule get_habermann_meta:
+    output:
+        "{dir}/habermann/metadata.csv",
+    params:
+        slurm__skip=True
+    shell:
+        """
+        wget "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE135893&format=file&file=GSE135893_IPF_metadata%2Ecsv%2Egz" \
+            -O {output}.gz
+        gunzip {output}
+        """

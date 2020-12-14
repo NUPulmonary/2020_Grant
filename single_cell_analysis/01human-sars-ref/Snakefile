@@ -1,0 +1,50 @@
+rule all:
+    input:
+            "../data/SARS-CoV-2i_and_GRCh38",
+
+
+rule sars_i_grch:
+    input:
+        fasta="NC_045512.2.fa",
+        gtf="NC_045512.2-i.gtf",
+        reference="refdata-cellranger-GRCh38-3.0.0"
+    output:
+        directory("../data/SARS-CoV-2i_and_GRCh38")
+    params:
+        slurm__cores = 16,
+        slurm__hours = 1,
+        slurm__mem = 40,
+    shell:
+        """
+        module purge all
+        module load cellranger/3.1.0
+
+        ref=`realpath {input.reference}`
+        fasta=`realpath {input.fasta}`
+        gtf=`realpath {input.gtf}`
+
+        cd `dirname {output}`
+        cellranger mkref \
+            --genome SARS-CoV-2i \
+            --genome GRCh38 \
+            --fasta $fasta \
+            --fasta $ref/fasta/genome.fa \
+            --genes $gtf \
+            --genes $ref/genes/genes.gtf \
+            --nthreads {params.slurm__cores} \
+            --memgb {params.slurm__mem}
+        rm Log.out
+        """
+
+
+rule cellranger_reference:
+    output:
+        directory("refdata-cellranger-GRCh38-3.0.0")
+    params:
+        slurm__skip=True
+    shell:
+        """
+        wget "https://cf.10xgenomics.com/supp/cell-exp/refdata-cellranger-GRCh38-3.0.0.tar.gz" \
+            -O "{output}.tar.gz"
+        tar xzf "{output}.tar.gz"
+        """

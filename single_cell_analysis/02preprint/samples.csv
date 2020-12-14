@@ -1,0 +1,10 @@
+Sample,Patient,Day of intubation,COVID-19
+Sample_1,4,1,True
+Sample_2,5,1,True
+Sample_3,3,1,True
+Sample_4,3,1,True
+Sample_5,1,2,True
+Sample_6,1,2,True
+Sample_7,2,0,True
+Sample_8,6,1,False
+Sample_9,6,1,False

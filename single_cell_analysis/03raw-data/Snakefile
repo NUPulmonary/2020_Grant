@@ -1,0 +1,234 @@
+import sys
+sys.path.insert(0, "../lib")
+
+import numpy as np
+import pandas as pd
+
+import geno_corr
+
+
+DATA_DIR = "../data/03raw-data"
+GENOTYPE = {
+    "Sample_14": 2,
+    "Sample_15": 2,
+    "Sample_16": 2,
+}
+
+
+def get_count_input_file(wildcards):
+    run_ids = SAMPLES.RunID[SAMPLES.Sample == wildcards.sample].values
+    return [ancient("../data/fastq/{RunID}".format(RunID=run_id)) for run_id in run_ids]
+
+
+rule all:
+    input:
+        [
+         expand("{dir}/souporcell/{sample}", sample=GENOTYPE.keys(), dir=DATA_DIR),
+         expand("{dir}/snips/{sample}.txt", sample=GENOTYPE.keys(), dir=DATA_DIR),
+         "plots/Sample_14-Sample_16-genotype.pdf",
+         "plots/Sample_15-Sample_16-genotype.pdf",
+         ]
+
+
+rule plot_patient_genotype:
+    input:
+        f"{DATA_DIR}/snips/{{sample1}}.txt",
+        f"{DATA_DIR}/snips/{{sample2}}.txt",
+    output:
+        "plots/{sample1}-{sample2}-genotype.pdf"
+    params:
+        slurm__skip=True
+    run:
+        geno_corr.plot_corr(input, output[0])
+
+
+rule genotype_snips:
+    input:
+        "{dir}/souporcell/{sample}"
+    output:
+        "{dir}/snips/{sample}.txt"
+    params:
+        slurm__skip=True
+    shell:
+        """
+        module purge all
+        module load bcftools
+        if [ !-d `dirname {output}` ]; then
+            mkdir `dirname {output}`
+        fi
+        bcftools query -f'%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n' {input}/cluster_genotypes.vcf > {output}
+        """
+
+
+rule souporcell:
+    input:
+        "{dir}/cellranger/{sample}",
+        "{dir}/../souporcell.sif",
+        "{dir}/../common_variants_grch38.vcf"
+    output:
+        directory("{dir}/souporcell/{sample}")
+    params:
+        slurm__hours=4,
+        slurm__cores=12,
+        slurm__mem=42,
+        clusters = lambda wildcards, input: GENOTYPE.get(wildcards.sample, 2)
+    shell:
+        """
+        module purge all
+        module load singularity
+
+        gunzip -c {input[0]}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz > \
+            {input[0]}/outs/filtered_feature_bc_matrix/barcodes.tsv
+        cur_dir=$(pwd)
+        ref=`realpath ../01human-sars-ref/refdata-cellranger-GRCh38-3.0.0`
+        sif=`realpath {input[1]}`
+        vcf=`basename {input[2]}`
+        data_dir=`dirname $sif`
+        this_dir=`basename {wildcards.dir}`
+        temp_dir=$(mktemp -d)
+        cd $temp_dir
+        singularity exec \
+            --bind $ref:/ref-genome \
+            --bind $data_dir:/data \
+            $sif souporcell_pipeline.py \
+                --common_variants /data/$vcf \
+                -i /data/$this_dir/cellranger/{wildcards.sample}/outs/possorted_genome_bam.bam \
+                -b /data/$this_dir/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv \
+                -f /ref-genome/fasta/genome.fa \
+                -t 12 \
+                -o /data/$this_dir/souporcell/{wildcards.sample} \
+                -k {params.clusters}
+        cd $cur_dir
+        rm -rf $temp_dir
+        rm {input[0]}/outs/filtered_feature_bc_matrix/barcodes.tsv
+        """
+
+
+rule get_souporcell:
+    output:
+        "../data/souporcell.sif",
+        "../data/common_variants_grch38.vcf"
+    params:
+        slurm__skip=True
+    shell:
+        """
+        # Taken from https://github.com/wheaton5/souporcell/blob/34eade2ad3a361f045a31f53fee58c2e0c49423f/README.md
+        wget --load-cookies /tmp/cookies.txt "https://docs.google.com/uc?export=download&confirm=$(wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate 'https://docs.google.com/uc?export=download&id=1tj2j8QZuGz8sylHgWbnejWyUn8n6m0Y8' -O- | sed -rn 's/.*confirm=([0-9A-Za-z_]+).*/\1\n/p')&id=1tj2j8QZuGz8sylHgWbnejWyUn8n6m0Y8" -O souporcell.sif && rm -rf /tmp/cookies.txt
+        wget --load-cookies /tmp/cookies.txt "https://docs.google.com/uc?export=download&confirm=$(wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate 'https://docs.google.com/uc?export=download&id=13aebUpEKrtjliyT9rYzRijtkNJVUk5F_' -O- | sed -rn 's/.*confirm=([0-9A-Za-z_]+).*/\1\n/p')&id=13aebUpEKrtjliyT9rYzRijtkNJVUk5F_" -O common_variants_grch38.vcf && rm -rf /tmp/cookies.txt
+        """
+
+
+rule sars_bam:
+    input:
+        "{dir}/cellranger/{sample}"
+    output:
+        "{dir}/sars-bam/{sample}.depth"
+    params:
+        slurm__hours=1,
+        slurm__cores=4,
+        slurm__mem=10
+    shell:
+        """
+        module purge all
+        module load samtools/1.10.1
+        dir=`dirname {output}`
+        bam=$dir/{wildcards.sample}.bam
+        samtools view -b \
+            {input}/outs/possorted_genome_bam.bam \
+            SARS-CoV-2i_NC_045512.2 \
+            > $bam
+        # 10x SC5P-R2 reads are reverse-stranded to the original RNA
+        # so sense reads to original RNA would have REVERSE flag
+        # and antisense reads to original RNA would not have REVERSE flag
+        samtools view -b -f 0x10 $bam \
+            > $dir/{wildcards.sample}.forward.bam
+        samtools view -b -F 0x10 $bam \
+            > $dir/{wildcards.sample}.reverse.bam
+        samtools depth -a $dir/{wildcards.sample}.forward.bam \
+            > $dir/{wildcards.sample}.forward.depth
+        samtools depth -a $dir/{wildcards.sample}.reverse.bam \
+            > $dir/{wildcards.sample}.reverse.depth
+        paste $dir/{wildcards.sample}.forward.depth \
+            $dir/{wildcards.sample}.reverse.depth \
+            > {output}
+        """
+
+
+rule metrics_summary:
+    input:
+        expand("{{dir}}/cellranger/{sample}", sample=SAMPLES.Sample.unique())
+    output: "{dir}/cellranger/metrics_summary.csv"
+    params:
+        slurm__skip=True
+    run:
+        result = []
+        for sample in input:
+            m = pd.read_csv(f"{sample}/outs/metrics_summary.csv")
+            m.insert(0, "Sample", os.path.basename(sample))
+            result.append(m)
+        result = sorted(result, key=lambda x: x.shape[1], reverse=True)
+        result = pd.concat(result, sort=False)
+        for column in result.columns:
+            if result[column].dtype not in ("int64", "float64"):
+                match = (~result[column].isna()) & result[column].str.match(r"^(\d+,)*\d+$")
+                new_column = result[column].copy()
+                new_column[match] = new_column.loc[match].str.replace(",", "")
+                result[column] = new_column
+        result.sort_values("Sample").to_csv(output[0], index=False)
+
+
+rule count_sars_i:
+    input: get_count_input_file
+    output: directory(f"{DATA_DIR}/cellranger/{{sample,SC\w+}}")
+    params:
+        slurm__cores=8,
+        slurm__hours=12,
+        slurm__mem=60,
+        input_paths=lambda wildcards, input: ",".join([os.path.realpath(i) for i in input]),
+        chemistry="auto"
+    shell:
+        """
+        module purge all
+        module load cellranger/3.1.0
+        cd `dirname {output}`
+        cellranger count --id {wildcards.sample} \
+            --sample={wildcards.sample} \
+            --transcriptome=/projects/b1038/Pulmonary/nmarkov/script/data/SARS-CoV-2i_and_GRCh38 \
+            --fastqs={params.input_paths} \
+            --chemistry={params.chemistry}
+        """
+
+
+rule demultiplex:
+    input: ancient("../data/{RunID,\w+}.csv")
+    output: directory("../data/fastq/{RunID,\w+}")
+    params:
+        slurm__partition="genomics-himem",
+        slurm__cores=8,
+        slurm__hours=6,
+        slurm__mem=40,
+        lanes=lambda wildcards: ",".join(np.unique(SAMPLES.Lane[SAMPLES.RunID == wildcards.RunID].astype(str))),
+        flowcell=lambda wildcards: wildcards.RunID.split("_")[-1][1:]
+    shell:
+        """
+        module purge all
+        module load bcl2fastq
+        module load cellranger/3.1.0
+        cellranger mkfastq --run=../../raw/{wildcards.RunID} \
+            --csv={input[0]} \
+            --output-dir={output[0]}
+        rm -rf {params.flowcell}
+        rm __{params.flowcell}.mro
+        """
+
+
+rule prepare_samples:
+    input: "samples.csv"
+    output: "../data/{RunID,\w+}.csv"
+    params:
+        slurm__skip = 1
+    run:
+        SAMPLES.loc[SAMPLES.RunID == wildcards.RunID, ["Lane", "Sample", "Index"]].to_csv(
+            output[0],
+            index=False
+        )

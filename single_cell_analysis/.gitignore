@@ -1,0 +1,19 @@
+# R stuff
+.Rproj.user
+.Rhistory
+*.rds
+
+# Mac garbage
+.DS_Store
+._*
+
+# Snakemake
+.snakemake
+
+# Vscode
+.vscode
+
+# Python
+__pycache__
+.ipynb_checkpoints
+.venv
