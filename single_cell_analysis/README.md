@@ -25,5 +25,5 @@ This project uses [snakemake](https://snakemake.readthedocs.io/en/stable/) to ge
     [GSE155249](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE155249) wrongly assigns all  
     cells in `Sample 16` to `Patient A`. Correct value of `Patient` field for cells from `Sample 16`  
     is deposited in [`2023-07-17-sample-16-patient.csv`](2023-07-17-sample-16-patient.csv).  
-    GEO submission is being updated.
+    GEO submission has been updated.
 
